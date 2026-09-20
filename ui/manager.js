@@ -230,6 +230,28 @@ Untuk Windows: deploy Debian/Ubuntu dulu, lalu Menu 3 → Reinstall ke Windows.
   return { text, keyboard };
 }
 
+function formatIpOptions() {
+  const text = `🌐 <b>Pilih Tipe IP</b>
+
+Default: <b>IPv4 saja</b> (paling kompatibel, murah, disarankan untuk pemula).
+
+• <b>IPv4 saja</b> = VPS hanya dapat IPv4 publik (default, biaya paling rendah, kompatibel semua aplikasi)
+• <b>Dual IPv4+IPv6</b> = VPS dapat IPv4 + IPv6 publik (kalau butuh IPv6, mis. untuk akses IPv6-only atau testing)
+
+<i>Catatan: UpCloud mengenakan biaya untuk IPv4 tambahan, tapi IPv4 pertama & IPv6 biasanya termasuk plan. Pilih IPv4 saja kalau tidak butuh IPv6.</i>
+
+Pilih:`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '✅ IPv4 saja (default, disarankan)', callback_data: 'wiz:ip:ipv4' }],
+      [{ text: '🌐 IPv4 + IPv6 (dual)', callback_data: 'wiz:ip:dual' }],
+      [{ text: '❌ Batal', callback_data: 'wiz:cancel' }]
+    ]
+  };
+  return { text, keyboard };
+}
+
 function formatPasswordChoices(isOwner, config) {
   const text = `🔑 <b>Pilih Password VPS</b>
 
@@ -425,6 +447,7 @@ module.exports = {
   formatPlans,
   formatLoginMethods,
   formatTemplates,
+  formatIpOptions,
   formatPasswordChoices,
   formatServerList,
   formatServerDetail,

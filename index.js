@@ -676,6 +676,38 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
     await safeEdit(ctx, text, { reply_markup: keyboard });
   });
 
+  // Pilih tipe IP (IPv4 default)
+  bot.action(/wiz:ip:(ipv4|dual)/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const sess = getSession(ctx.from.id);
+    if (!sess || sess.type !== 'create_vps') return ctx.answerCbQuery('Sesi ini sudah tidak berlaku', { show_alert: true });
+    const choice = ctx.match[1];
+    sess.data.ipVersion = choice === 'dual' ? 'dual' : 'ipv4'; // default ipv4
+    sess.data.ipv6 = choice === 'dual' ? 'yes' : 'no';
+    sess.step = 'confirm';
+    setSession(ctx.from.id, sess);
+    const planInfo = sess.data.plan;
+    const osInfo = sess.data.osTitle || sess.data.osTemplateUuid;
+    const ipLabel = sess.data.ipVersion === 'dual' ? 'IPv4 + IPv6 (dual)' : 'IPv4 saja (default)';
+    const confirmText = `📋 <b>Konfirmasi Buat VPS</b>
+
+Akun: ${sess.data.accountId}
+Zona: ${sess.data.zone}
+Plan: ${planInfo}
+OS: ${osInfo}
+Login: ${sess.data.loginMode === 'password' ? 'Password otomatis' : 'SSH key sendiri'}
+Nama: ${sess.data.serverName}
+IP: ${ipLabel}
+${sess.data.loginMode === 'password' ? `Password: ${sess.data.passwordChoice === 'random' ? 'acak (akan ditampilkan)' : sess.data.passwordChoice}` : ''}
+
+⚠️ <b>Peringatan biaya:</b> VPS ditagih per jam sampai <b>dihapus</b>. VPS yang hanya di-Stop umumnya tetap ditagih karena resource masih dialokasikan.
+${sess.data.ipVersion === 'dual' ? '\nℹ️ Dual stack: VPS akan dapat IPv4 publik + IPv6 publik.' : '\nℹ️ Default: VPS hanya IPv4 publik (paling kompatibel).'}
+
+Yakin buat VPS?`;
+    const keyboard = { inline_keyboard: [[{ text: '✅ Ya, buat VPS', callback_data: 'wiz:confirm:create' }], [{ text: '❌ Batal', callback_data: 'wiz:cancel' }]] };
+    await safeEdit(ctx, confirmText, { reply_markup: keyboard });
+  });
+
   bot.action(/wiz:login:(password|key)/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
@@ -1525,37 +1557,24 @@ Yakin?`, { reply_markup: { inline_keyboard: [[{ text: '✅ Ya, rebuild', callbac
       }
     }
 
-    // Create VPS: ask_name
+    // Create VPS: ask_name -> pilih IP version (IPv4 default)
     if (sess.type === 'create_vps' && sess.step === 'ask_name') {
       const name = text.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0,20);
       if (name.length < 3) return safeReply(ctx, '❌ Nama terlalu pendek (min 3). Coba lagi.');
       sess.data.serverName = name;
-      sess.step = 'confirm';
+      sess.step = 'ask_ip_version';
       setSession(userId, sess);
-      // Tampilkan konfirmasi
-      const token = vault.getDecryptedToken(userId, sess.data.accountId);
-      const client = new UpCloudClient(token);
-      // Ambil detail plan & template untuk ringkasan
-      let planInfo = sess.data.plan;
-      let osInfo = sess.data.osTitle || sess.data.osTemplateUuid;
-      const confirmText = `📋 <b>Konfirmasi Buat VPS</b>
-
-Akun: ${sess.data.accountId}
-Zona: ${sess.data.zone}
-Plan: ${planInfo}
-OS: ${osInfo}
-Login: ${sess.data.loginMode === 'password' ? 'Password otomatis' : 'SSH key sendiri'}
-Nama: ${name}
-${sess.data.loginMode === 'password' ? `Password: ${sess.data.passwordChoice === 'random' ? 'acak (akan ditampilkan)' : sess.data.passwordChoice}` : ''}
-
-⚠️ <b>Peringatan biaya:</b> VPS ditagih per jam sampai <b>dihapus</b>. VPS yang hanya di-Stop umumnya tetap ditagih karena resource masih dialokasikan.
-
-Yakin buat VPS?`;
-      const keyboard = { inline_keyboard: [[{ text: '✅ Ya, buat VPS', callback_data: 'wiz:confirm:create' }], [{ text: '❌ Batal', callback_data: 'wiz:cancel' }]] };
-      return safeReply(ctx, confirmText, { reply_markup: keyboard });
+      const { text: ipText, keyboard } = ui.formatIpOptions();
+      return safeReply(ctx, `✅ Nama: <b>${name}</b>\n\n${ipText}`, { reply_markup: keyboard });
     }
 
-    // Setup VPS: await_ip
+    // Create VPS: ask_ip_version (text fallback)
+    if (sess.type === 'create_vps' && sess.step === 'ask_ip_version') {
+      const { text: ipText, keyboard } = ui.formatIpOptions();
+      return safeReply(ctx, ipText, { reply_markup: keyboard });
+    }
+
+        // Setup VPS: await_ip
     if ((sess.type === 'setup_vps' || sess.type === 'check_vps' || sess.type === 'reinstall') && sess.step === 'await_ip') {
       if (!validators.isValidIpOrHost(text)) {
         return safeReply(ctx, '❌ IP/host tidak valid. Masukkan IPv4/IPv6/hostname yang benar. /cancel untuk batal.');
@@ -2378,6 +2397,24 @@ Yakin?`;
             }
           }
         };
+        // IPv6 on/off (default IPv4 only)
+        const ipVer = sessData.ipVersion || 'ipv4';
+        if (ipVer === 'ipv4') {
+          // Default: hanya IPv4 publik (paling kompatibel, biaya rendah)
+          payload.server.ip_addresses = {
+            ip_address: [
+              { access: 'public', family: 'IPv4' }
+            ]
+          };
+        } else {
+          // Dual stack: IPv4 + IPv6 publik
+          payload.server.ip_addresses = {
+            ip_address: [
+              { access: 'public', family: 'IPv4' },
+              { access: 'public', family: 'IPv6' }
+            ]
+          };
+        }
         if (tpl.template_type === 'cloud-init') {
           payload.server.metadata = 'yes';
         }
