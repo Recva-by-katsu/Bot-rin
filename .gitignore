@@ -1,0 +1,9 @@
+node_modules/
+data/accounts.json
+data/vault.key
+data/keys/upcloud_ed25519
+data/keys/upcloud_ed25519.pub
+data/keys_test/
+data/quota.json
+data/logs/*.log
+*.zip
