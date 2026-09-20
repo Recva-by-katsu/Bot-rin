@@ -153,18 +153,86 @@ Zona = lokasi server fisik. Pilih yang dekat dengan pengguna kamu.
   return { text, keyboard };
 }
 
-function formatPlans(plans) {
-  let text = `📦 <b>Pilih Plan VPS</b>
+function getPlanCategory(plan) {
+  const name = (plan.name || '').toLowerCase();
+  if (name.includes('starter')) return 'starter';
+  if (name.includes('premium')) return 'premium';
+  if (name.includes('cloud native') || name.includes('native') || name.includes('cloud_native')) return 'cloud_native';
+  if (plan.gpu_amount && parseInt(plan.gpu_amount) > 0) return 'gpu';
+  if (plan.storage_size === 0 || plan.storage_tier === null) return 'cloud_native';
+  // Heuristik berdasarkan pricing UpCloud 2026:
+  // Starter: 10,20,30,40,50 GB dengan kombinasi tertentu
+  // Premium: 25,50,100,150,200,300,400,500
+  // Bedakan: 25GB pasti Premium, 10/20 pasti Starter, 30/40 cenderung Starter, 50 bisa keduanya
+  const mem = plan.memory_amount || 0;
+  const stor = plan.storage_size || 0;
+  const core = plan.core_number || 0;
+  if (stor === 25) return 'premium';
+  if (stor === 10 || stor === 20) return 'starter';
+  if (stor === 30 || stor === 40) return 'starter';
+  if (stor === 50) {
+    // Starter 16GB 50GB, Premium 2GB/4GB 50GB -> bedakan via mem
+    if (mem >= 16384) return 'starter'; // 16GB 50GB starter
+    if (mem <= 4096) return 'premium'; // 2GB/4GB 50GB premium
+    return 'starter';
+  }
+  if (stor >= 100) return 'premium';
+  // fallback
+  return 'premium';
+}
 
-Plan = spesifikasi CPU/RAM/Disk. Makin besar makin mahal.
+function formatPlanCategories(plans) {
+  const counts = { starter: 0, premium: 0, cloud_native: 0, other: 0 };
+  for (const p of plans) {
+    const cat = getPlanCategory(p);
+    if (counts[cat] !== undefined) counts[cat]++;
+    else counts.other++;
+  }
+  let text = `📦 <b>Pilih Kategori Plan</b>
+
+Sesuai panel UpCloud asli ada 3 tipe:
+
+• <b>Starter</b> (€3/mo+) – murah, untuk dev/test/self-hosting, 99.99% SLA
+• <b>Premium</b> (€5/mo+) – performa tinggi AMD EPYC + MaxIOPS, 99.999% SLA
+• <b>Cloud Native</b> (€12/mo+) – compute & storage terpisah, stop tidak ditagih
+
+Free trial limit contoh: max 6 CPU / 12GB RAM (sesuai screenshot)
+
+Ditemukan:
+• Starter: ${counts.starter} plan
+• Premium: ${counts.premium} plan
+• Cloud Native: ${counts.cloud_native} plan
+${counts.other ? `• Lainnya: ${counts.other} plan\n` : ''}
+
+Pilih kategori untuk lihat daftar (max 10 termurah per kategori).
+
+💰 Biaya per jam sampai dihapus. Stop tetap ditagih kecuali Cloud Native.
+`;
+  const keyboard = { inline_keyboard: [] };
+  if (counts.starter > 0) keyboard.inline_keyboard.push([{ text: `🚀 Starter (${counts.starter}) – dari €3/mo`, callback_data: 'wiz:plancat:starter' }]);
+  if (counts.premium > 0) keyboard.inline_keyboard.push([{ text: `⚡ Premium (${counts.premium}) – dari €5/mo`, callback_data: 'wiz:plancat:premium' }]);
+  if (counts.cloud_native > 0) keyboard.inline_keyboard.push([{ text: `☁️ Cloud Native (${counts.cloud_native}) – dari €12/mo`, callback_data: 'wiz:plancat:cloud_native' }]);
+  keyboard.inline_keyboard.push([{ text: `📋 Semua (${plans.length}) – termurah dulu`, callback_data: 'wiz:plancat:all' }]);
+  keyboard.inline_keyboard.push([{ text: '❌ Batal', callback_data: 'wiz:cancel' }]);
+  return { text, keyboard };
+}
+
+function formatPlans(plans, category = 'all') {
+  let catLabel = 'Semua';
+  if (category === 'starter') catLabel = 'Starter (€3/mo+)';
+  if (category === 'premium') catLabel = 'Premium (€5/mo+)';
+  if (category === 'cloud_native') catLabel = 'Cloud Native (€12/mo+)';
+  let text = `📦 <b>Pilih Plan – ${catLabel}</b>
+
+Plan = CPU/RAM/Disk. Makin besar makin mahal.
 
 ⭐ = Rekomendasi pemula (RAM ≥1GB, paling kecil & murah)
-
-💰 <b>Biaya:</b> VPS ditagih per jam sampai dihapus. VPS yang di-Stop umumnya tetap ditagih.
+${category === 'cloud_native' ? '\nℹ️ Cloud Native: storage tidak termasuk plan, akan dibuat terpisah sesuai template (di bot ini otomatis pakai size template). Compute tidak ditagih saat stopped.\n' : ''}
+💰 <b>Biaya:</b> VPS ditagih per jam sampai dihapus. VPS Stop tetap ditagih kecuali Cloud Native.
 
 `;
   const keyboard = { inline_keyboard: [] };
-  // Max 10 tombol
+  // Filter already done by caller, but ensure sorting still
   const toShow = plans.slice(0, 10);
   let smallestWith1GB = null;
   for (const p of plans) {
@@ -176,9 +244,14 @@ Plan = spesifikasi CPU/RAM/Disk. Makin besar makin mahal.
     const disk = p.storage_size;
     const isRec = smallestWith1GB && p.name === smallestWith1GB.name;
     const star = isRec ? '⭐ ' : '';
-    const label = `${star}${vcpu} vCPU · ${ram} GB RAM · ${disk} GB disk`.slice(0, 40);
+    const diskLabel = disk === 0 ? 'tanpa disk (CN)' : `${disk} GB disk`;
+    const label = `${star}${vcpu} vCPU · ${ram} GB · ${diskLabel}`.slice(0, 44);
     keyboard.inline_keyboard.push([{ text: label, callback_data: `wiz:plan:${p.name}` }]);
   }
+  if (plans.length > 10) {
+    text += `\nMenampilkan 10 dari ${plans.length} plan termurah di kategori ini.`;
+  }
+  keyboard.inline_keyboard.push([{ text: '⬅️ Kategori Lain', callback_data: 'wiz:plancat:back' }]);
   keyboard.inline_keyboard.push([{ text: '❌ Batal', callback_data: 'wiz:cancel' }]);
   return { text, keyboard };
 }
@@ -445,6 +518,8 @@ module.exports = {
   addAccountPrompt,
   formatZones,
   formatPlans,
+  formatPlanCategories,
+  getPlanCategory,
   formatLoginMethods,
   formatTemplates,
   formatIpOptions,

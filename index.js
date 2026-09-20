@@ -651,18 +651,48 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
     if (!sess || sess.type !== 'create_vps') return ctx.answerCbQuery('Sesi ini sudah tidak berlaku', { show_alert: true });
     const zone = ctx.match[1];
     sess.data.zone = zone;
-    sess.step = 'plan';
+    sess.step = 'plan_category';
     setSession(ctx.from.id, sess);
     try {
       const token = vault.getDecryptedToken(ctx.from.id, sess.data.accountId);
       const client = new UpCloudClient(token);
       const plans = await client.getPlans();
-      const { text, keyboard } = ui.formatPlans(plans);
+      sess.data.allPlans = plans;
+      setSession(ctx.from.id, sess);
+      const { text, keyboard } = ui.formatPlanCategories(plans);
       await safeEdit(ctx, text, { reply_markup: keyboard });
     } catch (e) {
       const c = new UpCloudClient('');
       await safeEdit(ctx, `❌ Gagal ambil plan: ${c.translateError(e)}`);
     }
+  });
+
+  // Kategori plan: starter/premium/cloud_native/all/back
+  bot.action(/wiz:plancat:(starter|premium|cloud_native|all|back)/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const sess = getSession(ctx.from.id);
+    if (!sess || sess.type !== 'create_vps') return ctx.answerCbQuery('Sesi ini sudah tidak berlaku', { show_alert: true });
+    const cat = ctx.match[1];
+    if (cat === 'back') {
+      const plans = sess.data.allPlans || [];
+      const { text, keyboard } = ui.formatPlanCategories(plans);
+      sess.step = 'plan_category';
+      setSession(ctx.from.id, sess);
+      return safeEdit(ctx, text, { reply_markup: keyboard });
+    }
+    const allPlans = sess.data.allPlans || [];
+    let filtered = allPlans;
+    if (cat !== 'all') {
+      filtered = allPlans.filter(p => ui.getPlanCategory(p) === cat);
+    }
+    if (filtered.length === 0) {
+      return safeEdit(ctx, `❌ Tidak ada plan di kategori ${cat}. Pilih kategori lain.`, { reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali ke Kategori', callback_data: 'wiz:plancat:back' }]] } });
+    }
+    sess.data.planCategory = cat;
+    sess.step = 'plan';
+    setSession(ctx.from.id, sess);
+    const { text, keyboard } = ui.formatPlans(filtered, cat);
+    await safeEdit(ctx, text, { reply_markup: keyboard });
   });
 
   bot.action(/wiz:plan:(.+)/, async (ctx) => {
@@ -2397,22 +2427,28 @@ Yakin?`;
             }
           }
         };
-        // IPv6 on/off (default IPv4 only)
+        // IPv6 on/off (default IPv4 only) - sesuai UpCloud API 1.3 networking.interfaces
         const ipVer = sessData.ipVersion || 'ipv4';
         if (ipVer === 'ipv4') {
-          // Default: hanya IPv4 publik (paling kompatibel, biaya rendah)
-          payload.server.ip_addresses = {
-            ip_address: [
-              { access: 'public', family: 'IPv4' }
-            ]
+          // Default: hanya IPv4 publik + utility (paling kompatibel, biaya rendah)
+          payload.server.networking = {
+            interfaces: {
+              interface: [
+                { ip_addresses: { ip_address: [{ family: 'IPv4' }] }, type: 'public' },
+                { ip_addresses: { ip_address: [{ family: 'IPv4' }] }, type: 'utility' }
+              ]
+            }
           };
         } else {
-          // Dual stack: IPv4 + IPv6 publik
-          payload.server.ip_addresses = {
-            ip_address: [
-              { access: 'public', family: 'IPv4' },
-              { access: 'public', family: 'IPv6' }
-            ]
+          // Dual stack: IPv4 + IPv6 publik + utility
+          payload.server.networking = {
+            interfaces: {
+              interface: [
+                { ip_addresses: { ip_address: [{ family: 'IPv4' }] }, type: 'public' },
+                { ip_addresses: { ip_address: [{ family: 'IPv4' }] }, type: 'utility' },
+                { ip_addresses: { ip_address: [{ family: 'IPv6' }] }, type: 'public' }
+              ]
+            }
           };
         }
         if (tpl.template_type === 'cloud-init') {
