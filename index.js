@@ -540,6 +540,14 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
       const username = accData.account?.username || 'unknown';
       let tokens = await client.getTokens();
       resultText = `✅ <b>Hidup</b>\nUsername: ${username}\n`;
+      // Simpan & tampilkan status trial
+      const tm = accData.account && accData.account.trial_mode;
+      if (tm !== undefined) {
+        vault.updateAccountMeta(ctx.from.id, accId, { trial_mode: tm });
+        const trial = ui.isTrialAccount({ trial_mode: tm });
+        if (trial === true) resultText += `Status: 🆓 <b>Free trial</b> (VPS baru max 6 CPU & 12GB RAM)\n`;
+        else if (trial === false) resultText += `Status: Reguler (bukan free trial)\n`;
+      }
       if (tokens) {
         resultText += `Total token di akun: ${tokens.length}\n`;
         for (const t of tokens.slice(0,5)) {
@@ -573,7 +581,9 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
         const client = new UpCloudClient(token, { timeout: 15000 });
         const accData = await client.getAccount();
         const tokens = await client.getTokens();
-        return { id: acc.id, label: acc.label, status: 'ok', username: accData.account?.username, tokens };
+        const tm = accData.account && accData.account.trial_mode;
+        if (tm !== undefined) vault.updateAccountMeta(ctx.from.id, acc.id, { trial_mode: tm });
+        return { id: acc.id, label: acc.label, status: 'ok', username: accData.account?.username, tokens, trial: ui.isTrialAccount({ trial_mode: tm }) === true };
       } catch (e) {
         const status = e.status === 401 ? '401' : e.status === 403 ? '403' : 'fail';
         return { id: acc.id, label: acc.label, status, error: e.message };
@@ -630,11 +640,30 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
     const accId = ctx.match[1];
     if (!vault.isOwner(ctx.from.id, accId)) return ctx.answerCbQuery('Bukan milikmu', { show_alert: true });
     // Mulai wizard
-    setSession(ctx.from.id, { type: 'create_vps', step: 'zone', data: { accountId: accId } });
+    const wizardData = { accountId: accId };
+    setSession(ctx.from.id, { type: 'create_vps', step: 'zone', data: wizardData });
     // Fetch zones
     try {
       const token = vault.getDecryptedToken(ctx.from.id, accId);
       const client = new UpCloudClient(token);
+      // Segarkan status trial (hanya kalau belum diketahui) — non-fatal
+      try {
+        const accRec = vault.findAccount(ctx.from.id, accId) || {};
+        let trial = ui.isTrialAccount(accRec);
+        if (trial === undefined) {
+          const accData = await client.getAccount();
+          const tm = accData.account && accData.account.trial_mode;
+          if (tm !== undefined) {
+            vault.updateAccountMeta(ctx.from.id, accId, { trial_mode: tm });
+            trial = ui.isTrialAccount({ trial_mode: tm });
+          }
+        }
+        if (trial !== undefined) {
+          wizardData.trialMode = trial;
+          const s = getSession(ctx.from.id);
+          if (s) { s.data.trialMode = trial; setSession(ctx.from.id, s); }
+        }
+      } catch (_) { /* trial tetap unknown, wizard lanjut */ }
       const zones = await client.getZones();
       const { text, keyboard } = ui.formatZones(zones);
       await safeEdit(ctx, text, { reply_markup: keyboard });
@@ -659,7 +688,7 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
       const plans = await client.getPlans();
       sess.data.allPlans = plans;
       setSession(ctx.from.id, sess);
-      const { text, keyboard } = ui.formatPlanCategories(plans);
+      const { text, keyboard } = ui.formatPlanCategories(plans, sess.data.trialMode);
       await safeEdit(ctx, text, { reply_markup: keyboard });
     } catch (e) {
       const c = new UpCloudClient('');
@@ -675,7 +704,7 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
     const cat = ctx.match[1];
     if (cat === 'back') {
       const plans = sess.data.allPlans || [];
-      const { text, keyboard } = ui.formatPlanCategories(plans);
+      const { text, keyboard } = ui.formatPlanCategories(plans, sess.data.trialMode);
       sess.step = 'plan_category';
       setSession(ctx.from.id, sess);
       return safeEdit(ctx, text, { reply_markup: keyboard });
@@ -720,9 +749,12 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
     const osInfo = sess.data.osTitle || sess.data.osTemplateUuid;
     const ipLabel = sess.data.ipVersion === 'dual' ? 'IPv4 + IPv6 (dual)' : 'IPv4 saja (default)';
     const planObj = (sess.data.allPlans || []).find(p => p.name === sess.data.plan);
-    const trialWarn = (planObj && !ui.isWithinFreeTrial(planObj))
-      ? '\n🔒 <b>Plan ini di luar limit free trial (max 6 CPU & 12GB RAM).</b> Kalau akunmu masih trial, UpCloud akan menolak pembuatannya — lebih aman pilih plan tanpa 🔒.'
-      : '';
+    let trialWarn = '';
+    if (planObj && !ui.isWithinFreeTrial(planObj)) {
+      trialWarn = sess.data.trialMode === true
+        ? '\n🔒 <b>Akunmu masih free trial, dan plan ini di luar limit (max 6 CPU & 12GB RAM) — UpCloud akan MENOLAK pembuatannya.</b> Lebih aman pilih plan tanpa 🔒.'
+        : '\n🔒 <b>Plan ini di luar limit free trial (max 6 CPU & 12GB RAM).</b> Kalau akunmu masih trial, UpCloud akan menolak pembuatannya — lebih aman pilih plan tanpa 🔒.';
+    }
     const confirmText = `📋 <b>Konfirmasi Buat VPS</b>
 
 Akun: ${sess.data.accountId}
@@ -1508,6 +1540,7 @@ Checklist:
         const client = new UpCloudClient(token);
         const acc = await client.getAccount();
         const username = acc.account?.username || 'unknown';
+        const trialMode = acc.account?.trial_mode; // "0"/"1" dari GET /1.3/account
         // Simpan
         const accounts = vault.getUserAccounts(userId);
         if (accounts.length >= (config.MAX_ACCOUNTS_PER_USER || 5) && !accounts.find(a=>a.username===username)) {
@@ -1515,8 +1548,11 @@ Checklist:
           clearSession(userId);
           return;
         }
-        const saved = vault.addOrUpdateAccount(userId, token, username, username);
-        await ctx.telegram.editMessageText(ctx.chat.id, tempMsg.message_id, undefined, `✅ Akun <b>${username}</b> berhasil disimpan! ID: ${saved.id}`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '☁️ Lihat Akun', callback_data: 'mgr:upcloud' }]] } });
+        const saved = vault.addOrUpdateAccount(userId, token, username, username, { trial_mode: trialMode });
+        const trialNote = ui.isTrialAccount({ trial_mode: trialMode }) === true
+          ? '\n\n🆓 <i>Akun ini masih free trial — VPS baru max 6 CPU & 12GB RAM (plan 🔒 tidak bisa dibuat).</i>'
+          : '';
+        await ctx.telegram.editMessageText(ctx.chat.id, tempMsg.message_id, undefined, `✅ Akun <b>${username}</b> berhasil disimpan! ID: ${saved.id}${trialNote}`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '☁️ Lihat Akun', callback_data: 'mgr:upcloud' }]] } });
         clearSession(userId);
       } catch (e) {
         const client = new UpCloudClient('');

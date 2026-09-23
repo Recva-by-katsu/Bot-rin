@@ -376,6 +376,55 @@ ok('free trial: label plan 🔒 di formatPlans', () => {
   assert(text.includes('free trial'), 'teks list plan menjelaskan limit free trial');
 });
 
+ok('free trial: isTrialAccount membaca trial_mode (tri-state)', () => {
+  const uiMod = require('../ui/manager');
+  assert(uiMod.isTrialAccount({ trial_mode: '1' }) === true, 'string "1" = trial');
+  assert(uiMod.isTrialAccount({ trial_mode: '0' }) === false, 'string "0" = bukan');
+  assert(uiMod.isTrialAccount({ trial_mode: 1 }) === true, 'number 1 = trial');
+  assert(uiMod.isTrialAccount({ trial_mode: 0 }) === false, 'number 0 = bukan');
+  assert(uiMod.isTrialAccount({}) === undefined, 'tanpa field = unknown');
+  assert(uiMod.isTrialAccount(null) === undefined, 'null = unknown');
+});
+
+ok('free trial: formatPlanCategories sesuai status trial akun', () => {
+  const uiMod = require('../ui/manager');
+  const plans = [
+    { name: '1xCPU-1GB-10GB', core_number: 1, memory_amount: 1024, storage_size: 10, storage_tier: 'hdd', price: 3, current_offering: 'yes' },
+    { name: '2xCPU-16GB-150GB', core_number: 2, memory_amount: 16384, storage_size: 150, storage_tier: 'maxiops', price: 72, current_offering: 'yes' }
+  ];
+  const t = uiMod.formatPlanCategories(plans, true).text;
+  assert(t.includes('MASIH FREE TRIAL'), 'akun trial -> peringatan khusus');
+  const f = uiMod.formatPlanCategories(plans, false).text;
+  assert(f.includes('bukan free trial'), 'akun reguler -> info bisa pilih 🔒');
+  const u = uiMod.formatPlanCategories(plans).text;
+  assert(!u.includes('MASIH FREE TRIAL') && !u.includes('bukan free trial'), 'status unknown -> tanpa tambahan');
+});
+
+ok('vault: trial_mode tersimpan di akun + updateAccountMeta', () => {
+  const accFile = path.join(__dirname, '..', 'data', 'accounts.json');
+  const backup = fs.existsSync(accFile) ? fs.readFileSync(accFile, 'utf8') : null;
+  const config = { ENCRYPTION_KEY: 'testkey1234567890123456789012345678' };
+  const vault = new Vault(config);
+  try {
+    if (fs.existsSync(accFile)) fs.unlinkSync(accFile);
+    // Add dengan meta trial_mode
+    const acc = vault.addOrUpdateAccount(222, 'ucat_t', 'trialuser', 'trialuser', { trial_mode: '1' });
+    assert(acc.trial_mode === '1', 'trial_mode tersimpan saat add');
+    // Update meta tanpa menyentuh token
+    const before = vault.getDecryptedToken(222, acc.id);
+    const updated = vault.updateAccountMeta(222, acc.id, { trial_mode: '0' });
+    assert(updated.trial_mode === '0', 'trial_mode diupdate');
+    assert(vault.getDecryptedToken(222, acc.id) === before, 'token tidak berubah');
+    // Meta undefined tidak menimpa nilai lama
+    const u2 = vault.updateAccountMeta(222, acc.id, { trial_mode: undefined });
+    assert(u2.trial_mode === '0', 'undefined tidak menimpa');
+    assert(vault.updateAccountMeta(222, 'aaaaaa', { trial_mode: '1' }) === null, 'akun tidak ada -> null');
+  } finally {
+    if (backup) fs.writeFileSync(accFile, backup);
+    else if (fs.existsSync(accFile)) fs.unlinkSync(accFile);
+  }
+});
+
 // === Test keygen ===
 okAsync('keygen: ED25519 generate & ssh2 parse (opsional jika ssh2 ada)', async () => {
   const tmpKeysDir = path.join(__dirname, '..', 'data', 'keys_test');

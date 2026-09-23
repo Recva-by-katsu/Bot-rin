@@ -70,11 +70,15 @@ Pilih akun untuk kelola, atau tambah akun baru.
 }
 
 function accountDetailMenu(account) {
+  const trial = isTrialAccount(account);
+  const trialLine = trial === true ? 'Status: 🆓 <b>Free trial</b> (VPS baru max 6 CPU & 12GB RAM)'
+    : trial === false ? 'Status: Reguler (bukan free trial)'
+    : '';
   const text = `🔑 <b>Akun: ${account.label}</b>
 Username: <code>${account.username}</code>
 ID: <code>${account.id}</code>
 Provider: UpCloud
-
+${trialLine ? trialLine + '\n' : ''}
 Pilih aksi:`;
   const keyboard = {
     inline_keyboard: [
@@ -182,6 +186,13 @@ function getPlanCategory(plan) {
   return 'premium';
 }
 
+// Status trial akun dari GET /1.3/account (field trial_mode: "0"/"1", 0, 1).
+// Tri-state: true = masih trial, false = bukan, undefined = belum diketahui
+function isTrialAccount(acc) {
+  if (!acc || acc.trial_mode === undefined || acc.trial_mode === null) return undefined;
+  return ['1', 1, 'yes', 'true', true].includes(acc.trial_mode);
+}
+
 // Limit free trial UpCloud: max 6 CPU & 12 GB RAM (sesuai panel)
 function isWithinFreeTrial(plan) {
   const cores = parseInt(plan.core_number || 0, 10);
@@ -189,7 +200,7 @@ function isWithinFreeTrial(plan) {
   return cores <= 6 && memMB <= 12 * 1024;
 }
 
-function formatPlanCategories(plans) {
+function formatPlanCategories(plans, trial) {
   const counts = { starter: 0, premium: 0, cloud_native: 0, other: 0 };
   for (const p of plans) {
     const cat = getPlanCategory(p);
@@ -205,6 +216,9 @@ Sesuai panel UpCloud asli ada 3 tipe:
 • <b>Cloud Native</b> (€12/mo+) – compute & storage terpisah, stop tidak ditagih
 
 Free trial: max 6 CPU & 12GB RAM. Plan bertanda 🔒 di luar limit ini tidak bisa dibuat di akun trial.
+${trial === true ? '\n⚠️ <b>Akun ini terdeteksi MASIH FREE TRIAL.</b> Plan bertanda 🔒 tidak bisa dibuat — pilih yang tanpa 🔒.'
+  : trial === false ? '\n✅ <b>Akun ini bukan free trial</b> — plan 🔒 juga bisa dibuat.'
+  : ''}
 
 Ditemukan:
 • Starter: ${counts.starter} plan
@@ -448,7 +462,7 @@ Bot cek semua akun tersimpan:
     let detail = '';
     if (r.status === 'ok') {
       icon = '✅ Hidup';
-      detail = `${r.username}`;
+      detail = `${r.username}${r.trial ? ' | 🆓 free trial' : ''}`;
       if (r.tokens) {
         detail += ` | ${r.tokens.length} token`;
         // Cek kedaluwarsa ≤7 hari
@@ -531,6 +545,7 @@ module.exports = {
   formatPlanCategories,
   getPlanCategory,
   isWithinFreeTrial,
+  isTrialAccount,
   formatLoginMethods,
   formatTemplates,
   formatIpOptions,
