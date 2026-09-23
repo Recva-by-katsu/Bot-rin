@@ -159,14 +159,15 @@ function getPlanCategory(plan) {
   if (name.includes('premium')) return 'premium';
   if (name.includes('cloud native') || name.includes('native') || name.includes('cloud_native')) return 'cloud_native';
   if (plan.gpu_amount && parseInt(plan.gpu_amount) > 0) return 'gpu';
-  if (plan.storage_size === 0 || plan.storage_tier === null) return 'cloud_native';
+  // storage_size bisa angka (0) atau string ("0") tergantung sumber data
+  const stor = parseInt(plan.storage_size, 10) || 0;
+  if (stor === 0 || plan.storage_tier === null || plan.storage_tier === '') return 'cloud_native';
   // Heuristik berdasarkan pricing UpCloud 2026:
   // Starter: 10,20,30,40,50 GB dengan kombinasi tertentu
   // Premium: 25,50,100,150,200,300,400,500
   // Bedakan: 25GB pasti Premium, 10/20 pasti Starter, 30/40 cenderung Starter, 50 bisa keduanya
-  const mem = plan.memory_amount || 0;
-  const stor = plan.storage_size || 0;
-  const core = plan.core_number || 0;
+  const mem = parseInt(plan.memory_amount, 10) || 0;
+  const core = parseInt(plan.core_number, 10) || 0;
   if (stor === 25) return 'premium';
   if (stor === 10 || stor === 20) return 'starter';
   if (stor === 30 || stor === 40) return 'starter';
@@ -179,6 +180,13 @@ function getPlanCategory(plan) {
   if (stor >= 100) return 'premium';
   // fallback
   return 'premium';
+}
+
+// Limit free trial UpCloud: max 6 CPU & 12 GB RAM (sesuai panel)
+function isWithinFreeTrial(plan) {
+  const cores = parseInt(plan.core_number || 0, 10);
+  const memMB = parseInt(plan.memory_amount || 0, 10);
+  return cores <= 6 && memMB <= 12 * 1024;
 }
 
 function formatPlanCategories(plans) {
@@ -196,7 +204,7 @@ Sesuai panel UpCloud asli ada 3 tipe:
 • <b>Premium</b> (€5/mo+) – performa tinggi AMD EPYC + MaxIOPS, 99.999% SLA
 • <b>Cloud Native</b> (€12/mo+) – compute & storage terpisah, stop tidak ditagih
 
-Free trial limit contoh: max 6 CPU / 12GB RAM (sesuai screenshot)
+Free trial: max 6 CPU & 12GB RAM. Plan bertanda 🔒 di luar limit ini tidak bisa dibuat di akun trial.
 
 Ditemukan:
 • Starter: ${counts.starter} plan
@@ -227,6 +235,7 @@ function formatPlans(plans, category = 'all') {
 Plan = CPU/RAM/Disk. Makin besar makin mahal.
 
 ⭐ = Rekomendasi pemula (RAM ≥1GB, paling kecil & murah)
+🔒 = Di luar limit free trial (max 6 CPU & 12GB RAM) — akun trial tidak bisa membuatnya
 ${category === 'cloud_native' ? '\nℹ️ Cloud Native: storage tidak termasuk plan, akan dibuat terpisah sesuai template (di bot ini otomatis pakai size template). Compute tidak ditagih saat stopped.\n' : ''}
 💰 <b>Biaya:</b> VPS ditagih per jam sampai dihapus. VPS Stop tetap ditagih kecuali Cloud Native.
 
@@ -241,11 +250,12 @@ ${category === 'cloud_native' ? '\nℹ️ Cloud Native: storage tidak termasuk p
   for (const p of toShow) {
     const vcpu = p.core_number;
     const ram = (p.memory_amount / 1024).toFixed(p.memory_amount % 1024 === 0 ? 0 : 1);
-    const disk = p.storage_size;
+    const disk = parseInt(p.storage_size, 10) || 0;
     const isRec = smallestWith1GB && p.name === smallestWith1GB.name;
     const star = isRec ? '⭐ ' : '';
+    const lock = isWithinFreeTrial(p) ? '' : '🔒 ';
     const diskLabel = disk === 0 ? 'tanpa disk (CN)' : `${disk} GB disk`;
-    const label = `${star}${vcpu} vCPU · ${ram} GB · ${diskLabel}`.slice(0, 44);
+    const label = `${star}${lock}${vcpu} vCPU · ${ram} GB · ${diskLabel}`.slice(0, 44);
     keyboard.inline_keyboard.push([{ text: label, callback_data: `wiz:plan:${p.name}` }]);
   }
   if (plans.length > 10) {
@@ -520,6 +530,7 @@ module.exports = {
   formatPlans,
   formatPlanCategories,
   getPlanCategory,
+  isWithinFreeTrial,
   formatLoginMethods,
   formatTemplates,
   formatIpOptions,
