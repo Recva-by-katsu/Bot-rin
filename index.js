@@ -92,10 +92,26 @@ async function init() {
 
   // Sesi percakapan in-memory per user
   const sessions = new Map(); // userId -> {type, step, data, createdAt}
+  const SESSION_TTL_MS = 30 * 60 * 1000; // sesi kedaluwarsa 30 menit
 
   function getSession(userId) {
-    return sessions.get(String(userId)) || null;
+    const s = sessions.get(String(userId));
+    if (!s) return null;
+    // Buang sesi basi supaya tidak macet/menumpuk di memori
+    if (Date.now() - (s.createdAt || 0) > SESSION_TTL_MS) {
+      sessions.delete(String(userId));
+      return null;
+    }
+    return s;
   }
+  // Sapu berkala (unref supaya tidak menahan proses)
+  const sessionSweeper = setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of sessions) {
+      if (now - (v.createdAt || 0) > SESSION_TTL_MS) sessions.delete(k);
+    }
+  }, 10 * 60 * 1000);
+  if (typeof sessionSweeper.unref === 'function') sessionSweeper.unref();
   function setSession(userId, sess) {
     sess.createdAt = Date.now();
     sessions.set(String(userId), sess);
@@ -205,6 +221,16 @@ async function init() {
     return false;
   }
 
+  // Perintah hapus public key bot dari authorized_keys (aman terhadap karakter base64 '/+/=').
+  // Kunci bot selalu berkomentar 'upcloud-ssh-bot'; potongan base64 dipakai sebagai cadangan
+  // dengan delimiter '|' karena alfabet base64 tidak mengandung '|'.
+  function buildRemoveBotKeyCmd(authKeysPath) {
+    const frag = (botPublicKey.split(' ')[1] || '').slice(0, 20);
+    let cmd = `sed -i '/upcloud-ssh-bot/d' ${authKeysPath} 2>/dev/null`;
+    if (frag) cmd += `; sed -i '|${frag}|d' ${authKeysPath} 2>/dev/null`;
+    return cmd + '; echo ok';
+  }
+
   // Helper: get decrypted token with ownership check
   function getTokenForAccount(userId, accountId) {
     if (!vault.isOwner(userId, accountId)) throw new Error('Akun bukan milikmu');
@@ -308,6 +334,7 @@ Total user: ${totalUsers}
 Total akun tersimpan: ${totalAccounts}
 Deploy berhasil: ${st.deploySuccess || 0}
 Deploy gagal: ${st.deployFail || 0}
+VPS dihapus: ${st.vpsDeleted || 0} (gagal: ${st.vpsDeleteFail || 0})
 Reinstall dimulai: ${st.reinstallStarted || 0}
 Reinstall gagal: ${st.reinstallFailed || 0}
 Job aktif: ${jobs.getActiveCount()} / ${config.MAX_CONCURRENT_JOBS}
@@ -409,13 +436,116 @@ Jika IP berubah, token yang dibatasi IP akan 403 (ditolak).
     else await safeReply(ctx, text, { reply_markup: keyboard });
   }
 
+  // === FLOW HELPERS (dipakai tombol & text handler) ===
+  function usernameKeyboard() {
+    return {
+      inline_keyboard: [
+        [{ text: 'root', callback_data: 'ssh:user:root' }, { text: 'ubuntu', callback_data: 'ssh:user:ubuntu' }, { text: 'debian', callback_data: 'ssh:user:debian' }],
+        [{ text: '✏️ Ketik manual', callback_data: 'ssh:user:custom' }]
+      ]
+    };
+  }
+
+  // Setelah sumber key dipilih/diupload: kalau IP sudah terisi (shortcut dari Kelola VPS),
+  // lewati permintaan IP dan langsung ke username. Return true kalau sudah ditangani.
+  async function proceedAfterKeySource(ctx, sess) {
+    if (!sess.data.ip) return false;
+    sess.step = 'await_username';
+    setSession(ctx.from.id, sess);
+    const text = `✅ Key diterima.\n\nIP VPS: <code>${validators.escapeHtml(sess.data.ip)}</code> (terisi otomatis)\n\nPilih username login:`;
+    if (ctx.callbackQuery) await safeEdit(ctx, text, { reply_markup: usernameKeyboard() });
+    else await safeReply(ctx, text, { reply_markup: usernameKeyboard() });
+    return true;
+  }
+
+  // Jalankan Check VPS (dipakai ssh:user:* & text handler await_username)
+  async function runCheckVpsJob(ctx, sessData) {
+    // Cek slot job dulu supaya pesan progress tidak menggantung kalau sibuk
+    const can = jobs.canStart(ctx.from.id);
+    if (!can.allowed) {
+      const msg = can.reason === 'user_busy' ? 'Kamu masih punya job aktif, tunggu selesai dulu.' : 'Server bot sedang sibuk, coba lagi sebentar.';
+      return safeReply(ctx, `⚠️ ${msg}`);
+    }
+    const chatId = ctx.chat.id;
+    const msg = await ctx.telegram.sendMessage(chatId, `🔍 Check VPS ${sessData.ip}...`);
+    const prog = new LiveProgress({ telegram: ctx.telegram }, chatId, msg.message_id, '🔍 Check VPS', 900);
+    prog.addStep('Koneksi SSH');
+    prog.addStep('Deteksi OS');
+    prog.addStep('Ambil konfigurasi SSH');
+    prog.addStep('Cek status layanan SSH');
+    prog.start();
+    jobs.runDetached(ctx.from.id, async () => {
+      let ssh = null;
+      try {
+        ssh = new SshSession({ host: sessData.ip, username: sessData.username, privateKey: sessData.privateKey, privateKeyPath: sessData.privateKeyPath });
+        prog.setRunning(0);
+        await ssh.connect();
+        prog.setDone(0, 'ok');
+        prog.setRunning(1);
+        const os = await require('./lib/osDetect').detectOS(ssh);
+        prog.setDone(1, `${os.id} ${os.versionId}`);
+        prog.setRunning(2);
+        const res = await ssh.exec('sshd -T 2>/dev/null | grep -E "^(port|passwordauthentication|permitrootlogin|pubkeyauthentication)"');
+        prog.setDone(2, 'ok');
+        prog.setRunning(3);
+        const res2 = await ssh.exec('systemctl is-active ssh 2>/dev/null || systemctl is-active sshd 2>/dev/null || service ssh status 2>/dev/null | head -n1');
+        prog.setDone(3, res2.stdout.trim().slice(0,20));
+        await prog.finish(`📋 <b>Laporan Check VPS</b>\n\nIP: ${validators.escapeHtml(sessData.ip)}\nUser: <code>${validators.escapeHtml(sessData.username)}</code>\nOS: ${validators.escapeHtml(os.id)} ${validators.escapeHtml(os.versionId)}\nConfig:\n<pre>${validators.escapeHtml(res.stdout.slice(0,500))}</pre>\nService: ${validators.escapeHtml(res2.stdout.slice(0,100))}\n`);
+      } catch (e) {
+        await prog.finish(`❌ Check gagal: ${validators.redactSecrets(validators.escapeHtml(e.message))}`);
+      } finally {
+        if (ssh) ssh.close();
+      }
+    });
+  }
+
+  // Tampilkan pilihan OS untuk reinstall (dipakai ssh:user:* & text handler await_username)
+  async function showReinstallOsChoice(ctx, sess) {
+    // Shortcut dari Kelola VPS belum memilih keluarga OS — tanyakan dulu tanpa menghapus data sesi
+    if (!sess.data.osType) {
+      const text0 = `💿 <b>Pilih Keluarga OS</b>\n\nIP: <code>${validators.escapeHtml(sess.data.ip || '?')}</code>\nUser: <code>${validators.escapeHtml(sess.data.username || 'root')}</code>\n\nMau install OS apa? (SEMUA DATA DIHAPUS!)`;
+      const kb0 = {
+        inline_keyboard: [
+          [{ text: '🐧 Linux', callback_data: 'reinstall:ostype:linux' }],
+          [{ text: '🪟 Windows', callback_data: 'reinstall:ostype:windows' }],
+          [{ text: '❌ Batal', callback_data: 'wiz:cancel' }]
+        ]
+      };
+      if (ctx.callbackQuery) return safeEdit(ctx, text0, { reply_markup: kb0 });
+      return safeReply(ctx, text0, { reply_markup: kb0 });
+    }
+    if (sess.data.osType === 'linux') {
+      const text2 = `🐧 <b>Pilih Distro Linux</b>\n\nPilih OS yang akan diinstall (SEMUA DATA DIHAPUS!):`;
+      const keyboard2 = {
+        inline_keyboard: [
+          [{ text: 'Debian 12', callback_data: 'reinstall:linux:debian:12' }, { text: 'Debian 13', callback_data: 'reinstall:linux:debian:13' }],
+          [{ text: 'Ubuntu 22.04', callback_data: 'reinstall:linux:ubuntu:22.04' }, { text: 'Ubuntu 24.04', callback_data: 'reinstall:linux:ubuntu:24.04' }],
+          [{ text: 'AlmaLinux 9', callback_data: 'reinstall:linux:almalinux:9' }, { text: 'Rocky Linux 9', callback_data: 'reinstall:linux:rocky:9' }],
+          [{ text: '❌ Batal', callback_data: 'wiz:cancel' }]
+        ]
+      };
+      if (ctx.callbackQuery) return safeEdit(ctx, text2, { reply_markup: keyboard2 });
+      return safeReply(ctx, text2, { reply_markup: keyboard2 });
+    }
+    // Windows
+    const text2 = `🪟 <b>Pilih ISO Windows</b>\n\nPilih preset atau kirim link ISO sendiri:`;
+    const keyboard2 = { inline_keyboard: [] };
+    for (const p of config.WINDOWS_PRESETS) {
+      keyboard2.inline_keyboard.push([{ text: p.label, callback_data: `reinstall:winpreset:${p.label}` }]);
+    }
+    keyboard2.inline_keyboard.push([{ text: '🔗 Link ISO sendiri', callback_data: 'reinstall:win:customiso' }]);
+    keyboard2.inline_keyboard.push([{ text: '❌ Batal', callback_data: 'wiz:cancel' }]);
+    if (ctx.callbackQuery) return safeEdit(ctx, text2, { reply_markup: keyboard2 });
+    return safeReply(ctx, text2, { reply_markup: keyboard2 });
+  }
+
   // === CALLBACK HANDLERS ===
-  bot.action(/menu:main/, async (ctx) => {
+  bot.action(/^menu:main$/, async (ctx) => {
     clearSession(ctx.from.id);
     await ctx.answerCbQuery();
     await showMainMenu(ctx);
   });
-  bot.action(/menu:accounts/, async (ctx) => {
+  bot.action(/^menu:accounts$/, async (ctx) => {
     await ctx.answerCbQuery();
     if (config.MANAGER_OWNER_ONLY && !isOwner(ctx.from.id)) {
       return safeEdit(ctx, '🔒 Manajer Akun hanya untuk owner bot.', { reply_markup: { inline_keyboard: [[{ text: '🏠 Menu Utama', callback_data: 'menu:main' }]] } });
@@ -423,26 +553,26 @@ Jika IP berubah, token yang dibatasi IP akan 403 (ditolak).
     const { text, keyboard } = ui.providerMenu();
     await safeEdit(ctx, text, { reply_markup: keyboard });
   });
-  bot.action(/menu:ssh/, async (ctx) => {
+  bot.action(/^menu:ssh$/, async (ctx) => {
     await ctx.answerCbQuery();
     await showSshMenu(ctx);
   });
-  bot.action(/menu:os/, async (ctx) => {
+  bot.action(/^menu:os$/, async (ctx) => {
     await ctx.answerCbQuery();
     await showOsMenu(ctx);
   });
-  bot.action(/menu:ip/, async (ctx) => {
+  bot.action(/^menu:ip$/, async (ctx) => {
     await ctx.answerCbQuery();
     await showIp(ctx);
   });
-  bot.action(/guide:(\d+)/, async (ctx) => {
+  bot.action(/^guide:(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const idx = parseInt(ctx.match[1], 10);
     await showGuide(ctx, idx);
   });
 
   // Manager UpCloud
-  bot.action(/mgr:upcloud$/, async (ctx) => {
+  bot.action(/^mgr:upcloud$/, async (ctx) => {
     await ctx.answerCbQuery();
     if (config.MANAGER_OWNER_ONLY && !isOwner(ctx.from.id)) {
       return safeEdit(ctx, '🔒 Manajer Akun hanya untuk owner bot.');
@@ -452,14 +582,14 @@ Jika IP berubah, token yang dibatasi IP akan 403 (ditolak).
     await safeEdit(ctx, text, { reply_markup: keyboard });
   });
 
-  bot.action(/mgr:consent:ok/, async (ctx) => {
+  bot.action(/^mgr:consent:ok$/, async (ctx) => {
     await ctx.answerCbQuery();
     const { text } = ui.addAccountPrompt(BOT_PUBLIC_IP);
     setSession(ctx.from.id, { type: 'add_account', step: 'await_token', data: {} });
     await safeEdit(ctx, text + '\n\nKirim token sekarang (pesan akan dihapus).', { reply_markup: { inline_keyboard: [[{ text: '❌ Batal', callback_data: 'mgr:upcloud' }]] } });
   });
 
-  bot.action(/mgr:upcloud:add/, async (ctx) => {
+  bot.action(/^mgr:upcloud:add$/, async (ctx) => {
     await ctx.answerCbQuery();
     const accounts = vault.getUserAccounts(ctx.from.id);
     if (accounts.length >= (config.MAX_ACCOUNTS_PER_USER || 5)) {
@@ -470,7 +600,7 @@ Jika IP berubah, token yang dibatasi IP akan 403 (ditolak).
     await safeEdit(ctx, text, { reply_markup: keyboard });
   });
 
-  bot.action(/mgr:upcloud:deleteall/, async (ctx) => {
+  bot.action(/^mgr:upcloud:deleteall$/, async (ctx) => {
     await ctx.answerCbQuery();
     const accounts = vault.getUserAccounts(ctx.from.id);
     if (accounts.length === 0) return safeEdit(ctx, 'Tidak ada akun tersimpan.');
@@ -485,14 +615,14 @@ Kamu punya ${accounts.length} akun. Yakin hapus semua?`;
     };
     await safeEdit(ctx, text, { reply_markup: keyboard });
   });
-  bot.action(/mgr:upcloud:deleteall:confirm/, async (ctx) => {
+  bot.action(/^mgr:upcloud:deleteall:confirm$/, async (ctx) => {
     await ctx.answerCbQuery();
     const count = vault.deleteAllUserAccounts(ctx.from.id);
     await safeEdit(ctx, `✅ Berhasil hapus ${count} akun.`, { reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali', callback_data: 'mgr:upcloud' }]] } });
   });
 
   // Account detail
-  bot.action(/mgr:acc:([a-f0-9]{6})$/, async (ctx) => {
+  bot.action(/^mgr:acc:([a-f0-9]{6})$/, async (ctx) => {
     await ctx.answerCbQuery();
     const accId = ctx.match[1];
     if (!vault.isOwner(ctx.from.id, accId)) return ctx.answerCbQuery('Sesi ini sudah tidak berlaku atau bukan milikmu', { show_alert: true });
@@ -501,7 +631,7 @@ Kamu punya ${accounts.length} akun. Yakin hapus semua?`;
     await safeEdit(ctx, text, { reply_markup: keyboard });
   });
 
-  bot.action(/mgr:acc:([a-f0-9]{6}):delete/, async (ctx) => {
+  bot.action(/^mgr:acc:([a-f0-9]{6}):delete$/, async (ctx) => {
     await ctx.answerCbQuery();
     const accId = ctx.match[1];
     if (!vault.isOwner(ctx.from.id, accId)) return ctx.answerCbQuery('Bukan milikmu', { show_alert: true });
@@ -517,7 +647,7 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
     };
     await safeEdit(ctx, text, { reply_markup: keyboard });
   });
-  bot.action(/mgr:acc:([a-f0-9]{6}):delete:confirm/, async (ctx) => {
+  bot.action(/^mgr:acc:([a-f0-9]{6}):delete:confirm$/, async (ctx) => {
     await ctx.answerCbQuery();
     const accId = ctx.match[1];
     if (!vault.isOwner(ctx.from.id, accId)) return;
@@ -528,7 +658,7 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
   });
 
   // Check API single
-  bot.action(/mgr:acc:([a-f0-9]{6}):check/, async (ctx) => {
+  bot.action(/^mgr:acc:([a-f0-9]{6}):check$/, async (ctx) => {
     await ctx.answerCbQuery('🔍 Mengecek API...');
     const accId = ctx.match[1];
     if (!vault.isOwner(ctx.from.id, accId)) return;
@@ -539,7 +669,7 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
       const accData = await client.getAccount();
       const username = accData.account?.username || 'unknown';
       let tokens = await client.getTokens();
-      resultText = `✅ <b>Hidup</b>\nUsername: ${username}\n`;
+      resultText = `✅ <b>Hidup</b>\nUsername: ${validators.escapeHtml(username)}\n`;
       // Simpan & tampilkan status trial
       const tm = accData.account && accData.account.trial_mode;
       if (tm !== undefined) {
@@ -552,7 +682,7 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
         resultText += `Total token di akun: ${tokens.length}\n`;
         for (const t of tokens.slice(0,5)) {
           const exp = t.expires_at ? new Date(t.expires_at).toLocaleDateString() : 'no exp';
-          resultText += `- ${t.name}: exp ${exp}\n`;
+          resultText += `- ${validators.escapeHtml(t.name)}: exp ${exp}\n`;
           if (t.expires_at) {
             const diff = (new Date(t.expires_at).getTime() - Date.now())/(1000*60*60*24);
             if (diff <= 7) resultText += `  ⚠️ Token mau kedaluwarsa ≤7 hari!\n`;
@@ -567,7 +697,7 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
   });
 
   // Check all
-  bot.action(/mgr:upcloud:checkall/, async (ctx) => {
+  bot.action(/^mgr:upcloud:checkall$/, async (ctx) => {
     await ctx.answerCbQuery('🔍 Mengecek semua akun...');
     const accounts = vault.getUserAccounts(ctx.from.id);
     if (accounts.length === 0) return safeEdit(ctx, 'Belum ada akun.');
@@ -608,12 +738,19 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
     }
     await Promise.all(workers);
     const { text, keyboard } = ui.formatCheckApiResults(results, BOT_PUBLIC_IP);
-    await safeEdit({ ...ctx, chat: ctx.chat, telegram: ctx.telegram, editMessageText: (chatId, msgId, _, txt, extra) => ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, txt, extra) }, text, { reply_markup: keyboard }).catch(async () => {
-      await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, text, { parse_mode: 'HTML', reply_markup: keyboard });
-    });
+    try {
+      // Sunting pesan progress "Mengecek..." menjadi hasil akhir
+      await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, undefined, text, { parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: keyboard });
+    } catch (e) {
+      const em = e.message || '';
+      if (!em.includes('message is not modified')) {
+        console.error('checkall final edit gagal:', validators.redactSecrets(em));
+        await safeReply(ctx, text, { reply_markup: keyboard });
+      }
+    }
   });
 
-  bot.action(/mgr:upcloud:cleanDead/, async (ctx) => {
+  bot.action(/^mgr:upcloud:cleanDead$/, async (ctx) => {
     await ctx.answerCbQuery();
     const accounts = vault.getUserAccounts(ctx.from.id);
     let deleted = 0;
@@ -635,7 +772,7 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
   });
 
   // === BUAT VPS WIZARD ===
-  bot.action(/mgr:acc:([a-f0-9]{6}):create/, async (ctx) => {
+  bot.action(/^mgr:acc:([a-f0-9]{6}):create$/, async (ctx) => {
     await ctx.answerCbQuery();
     const accId = ctx.match[1];
     if (!vault.isOwner(ctx.from.id, accId)) return ctx.answerCbQuery('Bukan milikmu', { show_alert: true });
@@ -674,7 +811,7 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
     }
   });
 
-  bot.action(/wiz:zone:(.+)/, async (ctx) => {
+  bot.action(/^wiz:zone:(.+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'create_vps') return ctx.answerCbQuery('Sesi ini sudah tidak berlaku', { show_alert: true });
@@ -693,11 +830,13 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
     } catch (e) {
       const c = new UpCloudClient('');
       await safeEdit(ctx, `❌ Gagal ambil plan: ${c.translateError(e)}`);
+      // Sesi ditinggalkan dalam keadaan tanpa allPlans — bersihkan supaya tidak macet
+      clearSession(ctx.from.id);
     }
   });
 
   // Kategori plan: starter/premium/cloud_native/all/back
-  bot.action(/wiz:plancat:(starter|premium|cloud_native|all|back)/, async (ctx) => {
+  bot.action(/^wiz:plancat:(starter|premium|cloud_native|all|back)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'create_vps') return ctx.answerCbQuery('Sesi ini sudah tidak berlaku', { show_alert: true });
@@ -724,7 +863,7 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
     await safeEdit(ctx, text, { reply_markup: keyboard });
   });
 
-  bot.action(/wiz:plan:(.+)/, async (ctx) => {
+  bot.action(/^wiz:plan:(.+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'create_vps') return ctx.answerCbQuery('Sesi ini sudah tidak berlaku', { show_alert: true });
@@ -736,7 +875,7 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
   });
 
   // Pilih tipe IP (IPv4 default)
-  bot.action(/wiz:ip:(ipv4|dual)/, async (ctx) => {
+  bot.action(/^wiz:ip:(ipv4|dual)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'create_vps') return ctx.answerCbQuery('Sesi ini sudah tidak berlaku', { show_alert: true });
@@ -775,7 +914,7 @@ Yakin buat VPS?`;
     await safeEdit(ctx, confirmText, { reply_markup: keyboard });
   });
 
-  bot.action(/wiz:login:(password|key)/, async (ctx) => {
+  bot.action(/^wiz:login:(password|key)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess) return ctx.answerCbQuery('Sesi ini sudah tidak berlaku', { show_alert: true });
@@ -811,7 +950,7 @@ Yakin buat VPS?`;
     }
   });
 
-  bot.action(/wiz:os:(.+)/, async (ctx) => {
+  bot.action(/^wiz:os:(.+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'create_vps') return ctx.answerCbQuery('Sesi ini sudah tidak berlaku', { show_alert: true });
@@ -850,7 +989,7 @@ Ketik /cancel untuk batal.`, { reply_markup: { inline_keyboard: [[{ text: '📖 
   });
 
   // Password choice for create VPS & others
-  bot.action(/wiz:pw:(random|custom|default)/, async (ctx) => {
+  bot.action(/^wiz:pw:(random|custom|default)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess) return ctx.answerCbQuery('Sesi ini sudah tidak berlaku', { show_alert: true });
@@ -932,14 +1071,14 @@ Yakin?`;
     }
   }
 
-  bot.action(/wiz:cancel/, async (ctx) => {
+  bot.action(/^wiz:cancel$/, async (ctx) => {
     await ctx.answerCbQuery();
     clearSession(ctx.from.id);
     await safeEdit(ctx, '❌ Dibatalkan.', { reply_markup: { inline_keyboard: [[{ text: '🏠 Menu Utama', callback_data: 'menu:main' }]] } });
   });
 
   // Billing
-  bot.action(/mgr:acc:([a-f0-9]{6}):billing/, async (ctx) => {
+  bot.action(/^mgr:acc:([a-f0-9]{6}):billing$/, async (ctx) => {
     await ctx.answerCbQuery('💰 Mengambil tagihan...');
     const accId = ctx.match[1];
     if (!vault.isOwner(ctx.from.id, accId)) return;
@@ -955,11 +1094,11 @@ Yakin?`;
       let lastBilling = { total: 'N/A', currency: '', month: lastMonth };
       try {
         const cur = await client.getBillingSummary(curMonth);
-        curBilling = { total: cur.billing?.total_amount || 'N/A', currency: cur.billing?.currency || '', month: curMonth };
+        curBilling = { total: UpCloudClient.parseBillingTotal(cur) || 'N/A', currency: UpCloudClient.parseBillingCurrency(cur), month: curMonth };
       } catch {}
       try {
         const last = await client.getBillingSummary(lastMonth);
-        lastBilling = { total: last.billing?.total_amount || 'N/A', currency: last.billing?.currency || '', month: lastMonth };
+        lastBilling = { total: UpCloudClient.parseBillingTotal(last) || 'N/A', currency: UpCloudClient.parseBillingCurrency(last), month: lastMonth };
       } catch {}
       const servers = await client.getServers().catch(()=>[]);
       const accountInfo = { id: accId, label: vault.findAccount(ctx.from.id, accId).label, username: accData.account?.username, credits: accData.account?.credits };
@@ -972,7 +1111,7 @@ Yakin?`;
   });
 
   // Server list
-  bot.action(/mgr:acc:([a-f0-9]{6}):list/, async (ctx) => {
+  bot.action(/^mgr:acc:([a-f0-9]{6}):list$/, async (ctx) => {
     await ctx.answerCbQuery('🖥 Mengambil daftar VPS...');
     const accId = ctx.match[1];
     if (!vault.isOwner(ctx.from.id, accId)) return;
@@ -989,7 +1128,7 @@ Yakin?`;
   });
 
   // Server detail (stateless)
-  bot.action(/srv:([a-f0-9]{6}):([a-f0-9-]{36})/, async (ctx) => {
+  bot.action(/^srv:([a-f0-9]{6}):([a-f0-9-]{36})$/, async (ctx) => {
     await ctx.answerCbQuery();
     const accId = ctx.match[1];
     const uuid = ctx.match[2];
@@ -1007,7 +1146,7 @@ Yakin?`;
   });
 
   // Server actions
-  bot.action(/srvact:([a-f0-9]{6}):([a-f0-9-]{36}):(start|stop|restart|delete|vnc|ssh|os|rebuild|fw|fwlock)/, async (ctx) => {
+  bot.action(/^srvact:([a-f0-9]{6}):([a-f0-9-]{36}):(start|stop|restart|delete|vnc|ssh|os|rebuild|fw|fwlock)$/, async (ctx) => {
     const accId = ctx.match[1];
     const uuid = ctx.match[2];
     const action = ctx.match[3];
@@ -1032,7 +1171,8 @@ Yakin?`;
 ⚠️ <b>PERMANEN!</b> Semua data di VPS ini akan DIHAPUS dan tidak bisa dikembalikan. VPS akan di-Stop dulu kalau masih running, lalu dihapus dengan storages & backups.
 
 Yakin?`;
-      const keyboard = { inline_keyboard: [[{ text: '✅ Ya, hapus permanen', callback_data: `srvact:${accId}:${uuid}:delete:confirm` }], [{ text: '❌ Batal', callback_data: `srv:${accId}:${uuid}` }]] };
+      // Catatan: callback_data maks 64 byte; ':delc' dipakai karena ':delete:confirm' = 65 byte (ditolak Telegram)
+      const keyboard = { inline_keyboard: [[{ text: '✅ Ya, hapus permanen', callback_data: `srvact:${accId}:${uuid}:delc` }], [{ text: '❌ Batal', callback_data: `srv:${accId}:${uuid}` }]] };
       await safeEdit(ctx, text, { reply_markup: keyboard });
     } else if (action === 'vnc') {
       try {
@@ -1074,7 +1214,7 @@ Berguna untuk darurat kalau VPS macet setelah reinstall.
         const text = `🔐 <b>Aktifkan Password - IP otomatis</b>
 
 IP terisi otomatis: <code>${ipv4}</code>
-VPS: ${srv.title}
+VPS: ${validators.escapeHtml(srv.title)}
 
 Pilih sumber key:`;
         const keyboard = { inline_keyboard: [[{ text: '🔑 Key bawaan bot', callback_data: 'ssh:source:bot' }], [{ text: '🔑 Key sendiri', callback_data: 'ssh:source:custom' }], [{ text: '❌ Batal', callback_data: `srv:${accId}:${uuid}` }]] };
@@ -1093,7 +1233,7 @@ Pilih sumber key:`;
         const text = `💿 <b>Reinstall via Menu 3 - IP otomatis</b>
 
 IP: <code>${ipv4}</code>
-VPS: ${srv.title}
+VPS: ${validators.escapeHtml(srv.title)}
 
 Pilih sumber key:`;
         const keyboard = { inline_keyboard: [[{ text: '🔑 Key bawaan bot', callback_data: 'reinstall:source:bot' }], [{ text: '🔑 Key sendiri', callback_data: 'reinstall:source:custom' }], [{ text: '❌ Batal', callback_data: `srv:${accId}:${uuid}` }]] };
@@ -1108,8 +1248,6 @@ Pilih sumber key:`;
         const token = vault.getDecryptedToken(ctx.from.id, accId);
         const cl = new UpCloudClient(token);
         const templates = await cl.getTemplates();
-        const { text, keyboard } = ui.formatTemplates(templates, 'password'); // tampilkan semua linux, tapi nanti filter
-        // Override callback untuk rebuild
         const kb = { inline_keyboard: [] };
         for (const tpl of templates.slice(0,10)) {
           kb.inline_keyboard.push([{ text: tpl.title.slice(0,40), callback_data: `rebuild:os:${tpl.uuid}` }]);
@@ -1142,7 +1280,7 @@ Ketik /cancel untuk batal.`);
     }
   });
 
-  bot.action(/srvact:([a-f0-9]{6}):([a-f0-9-]{36}):delete:confirm/, async (ctx) => {
+  bot.action(/^srvact:([a-f0-9]{6}):([a-f0-9-]{36}):delc$/, async (ctx) => {
     await ctx.answerCbQuery('🗑 Menghapus...');
     const accId = ctx.match[1];
     const uuid = ctx.match[2];
@@ -1191,17 +1329,17 @@ Ketik /cancel untuk batal.`);
         await client.deleteServer(uuid);
         prog.setDone(2, 'terhapus');
         await prog.finish(`✅ VPS ${uuid} berhasil dihapus permanen.`);
-        stats.inc('deploySuccess'); // reuse?
+        stats.inc('vpsDeleted');
       } catch (e) {
         const c = new UpCloudClient('');
         prog.setFail(2, e.message.slice(0,42));
         await prog.finish(`❌ Gagal hapus VPS ${uuid}: ${c.translateError(e)}`);
-        stats.inc('deployFail');
+        stats.inc('vpsDeleteFail');
       }
     });
   });
 
-  bot.action(/srvact:([a-f0-9]{6}):([a-f0-9-]{36}):vnc:enable/, async (ctx) => {
+  bot.action(/^srvact:([a-f0-9]{6}):([a-f0-9-]{36}):vnc:enable$/, async (ctx) => {
     await ctx.answerCbQuery();
     const accId = ctx.match[1];
     const uuid = ctx.match[2];
@@ -1220,7 +1358,7 @@ Ketik /cancel untuk batal.`);
   });
 
   // Rebuild OS flow
-  bot.action(/rebuild:os:(.+)/, async (ctx) => {
+  bot.action(/^rebuild:os:(.+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'rebuild') return ctx.answerCbQuery('Sesi tidak berlaku', { show_alert: true });
@@ -1241,7 +1379,7 @@ Ketik /cancel untuk batal.`);
   });
 
   // Firewall list from account menu
-  bot.action(/mgr:acc:([a-f0-9]{6}):fwlist/, async (ctx) => {
+  bot.action(/^mgr:acc:([a-f0-9]{6}):fwlist$/, async (ctx) => {
     await ctx.answerCbQuery();
     const accId = ctx.match[1];
     if (!vault.isOwner(ctx.from.id, accId)) return;
@@ -1264,11 +1402,11 @@ Ketik /cancel untuk batal.`);
   });
 
   // === SSH MENU ACTIONS ===
-  bot.action(/ssh:showkey/, async (ctx) => {
+  bot.action(/^ssh:showkey$/, async (ctx) => {
     await ctx.answerCbQuery();
     await showSshKey(ctx);
   });
-  bot.action(/ssh:setup/, async (ctx) => {
+  bot.action(/^ssh:setup$/, async (ctx) => {
     await ctx.answerCbQuery();
     setSession(ctx.from.id, { type: 'setup_vps', step: 'source', data: {} });
     const text = `⚙️ <b>Setup VPS - Aktifkan Password</b>
@@ -1283,7 +1421,7 @@ Pilih sumber SSH key untuk login awal:`;
     };
     await safeEdit(ctx, text, { reply_markup: keyboard });
   });
-  bot.action(/ssh:check/, async (ctx) => {
+  bot.action(/^ssh:check$/, async (ctx) => {
     await ctx.answerCbQuery();
     setSession(ctx.from.id, { type: 'check_vps', step: 'source', data: {} });
     const text = `🔍 <b>Check VPS</b>
@@ -1299,7 +1437,7 @@ Pilih sumber key:`;
     await safeEdit(ctx, text, { reply_markup: keyboard });
   });
 
-  bot.action(/ssh:source:(bot|custom)/, async (ctx) => {
+  bot.action(/^ssh:source:(bot|custom)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'setup_vps') return ctx.answerCbQuery('Sesi tidak berlaku', { show_alert: true });
@@ -1321,6 +1459,8 @@ Ketik /cancel untuk batal.`);
       sess.data.privateKeyPath = botKeyPair.privPath;
       sess.step = 'await_ip';
       setSession(ctx.from.id, sess);
+      // Shortcut dari Kelola VPS: IP sudah terisi → lewati permintaan IP
+      if (await proceedAfterKeySource(ctx, sess)) return;
       await safeEdit(ctx, `✅ Pakai key bawaan bot.
 
 Sekarang kirim <b>IP/host VPS</b> (IPv4/IPv6/hostname).
@@ -1329,7 +1469,7 @@ Ketik /cancel untuk batal.`);
     }
   });
 
-  bot.action(/check:source:(bot|custom)/, async (ctx) => {
+  bot.action(/^check:source:(bot|custom)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'check_vps') return;
@@ -1343,11 +1483,13 @@ Ketik /cancel untuk batal.`);
       sess.data.privateKeyPath = botKeyPair.privPath;
       sess.step = 'await_ip';
       setSession(ctx.from.id, sess);
+      // Shortcut dari Kelola VPS: IP sudah terisi → lewati permintaan IP
+      if (await proceedAfterKeySource(ctx, sess)) return;
       await safeEdit(ctx, `✅ Pakai key bawaan bot. Kirim IP/host VPS.`);
     }
   });
 
-  bot.action(/ssh:user:(root|ubuntu|debian|custom)/, async (ctx) => {
+  bot.action(/^ssh:user:(root|ubuntu|debian|custom)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess) return;
@@ -1356,24 +1498,36 @@ Ketik /cancel untuk batal.`);
       sess.step = 'await_username';
       setSession(ctx.from.id, sess);
       await safeEdit(ctx, `👤 Ketik username manual (regex ^[a-z_][a-z0-9_-]{0,31}$, /skip = root):`);
-    } else {
-      sess.data.username = user;
-      sess.step = 'ask_password';
-      setSession(ctx.from.id, sess);
-      const { text, keyboard } = ui.formatPasswordChoices(isOwner(ctx.from.id), config);
-      await safeEdit(ctx, text, { reply_markup: keyboard });
+      return;
     }
+    sess.data.username = user;
+    // BUG FIX: alur berbeda per tipe sesi. Sebelumnya semua tipe dipaksa minta password,
+    // sehingga Check VPS yang tidak butuh password jadi macet total.
+    if (sess.type === 'check_vps') {
+      const sessData = { ...sess.data };
+      clearSession(ctx.from.id);
+      return runCheckVpsJob(ctx, sessData);
+    }
+    if (sess.type === 'reinstall') {
+      setSession(ctx.from.id, sess);
+      return showReinstallOsChoice(ctx, sess);
+    }
+    // setup_vps (default): butuh password
+    sess.step = 'ask_password';
+    setSession(ctx.from.id, sess);
+    const { text, keyboard } = ui.formatPasswordChoices(isOwner(ctx.from.id), config);
+    await safeEdit(ctx, text, { reply_markup: keyboard });
   });
 
   // OS menu
-  bot.action(/os:linux/, async (ctx) => {
+  bot.action(/^os:linux$/, async (ctx) => {
     await ctx.answerCbQuery();
     setSession(ctx.from.id, { type: 'reinstall', step: 'source', data: { osType: 'linux' } });
     const text = `🐧 <b>Pilih Sumber Key untuk Reinstall Linux</b>`;
     const keyboard = { inline_keyboard: [[{ text: '🔑 Key bawaan bot', callback_data: 'reinstall:source:bot' }], [{ text: '🔑 Key sendiri', callback_data: 'reinstall:source:custom' }], [{ text: '❌ Batal', callback_data: 'menu:os' }]] };
     await safeEdit(ctx, text, { reply_markup: keyboard });
   });
-  bot.action(/os:windows/, async (ctx) => {
+  bot.action(/^os:windows$/, async (ctx) => {
     await ctx.answerCbQuery();
     setSession(ctx.from.id, { type: 'reinstall', step: 'source', data: { osType: 'windows' } });
     const text = `🪟 <b>Pilih Sumber Key untuk Reinstall Windows</b>`;
@@ -1381,7 +1535,7 @@ Ketik /cancel untuk batal.`);
     await safeEdit(ctx, text, { reply_markup: keyboard });
   });
 
-  bot.action(/reinstall:source:(bot|custom)/, async (ctx) => {
+  bot.action(/^reinstall:source:(bot|custom)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'reinstall') return ctx.answerCbQuery('Sesi tidak berlaku', { show_alert: true });
@@ -1395,11 +1549,23 @@ Ketik /cancel untuk batal.`);
       sess.data.privateKeyPath = botKeyPair.privPath;
       sess.step = 'await_ip';
       setSession(ctx.from.id, sess);
+      // Shortcut dari Kelola VPS: IP sudah terisi → lewati permintaan IP
+      if (await proceedAfterKeySource(ctx, sess)) return;
       await safeEdit(ctx, `✅ Pakai key bawaan bot. Kirim IP/host VPS.`);
     }
   });
 
-  bot.action(/reinstall:linux:(.+):(.+)/, async (ctx) => {
+  // Pemilih keluarga OS untuk jalur shortcut (tidak mereset data sesi seperti os:linux/os:windows)
+  bot.action(/^reinstall:ostype:(linux|windows)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const sess = getSession(ctx.from.id);
+    if (!sess || sess.type !== 'reinstall') return ctx.answerCbQuery('Sesi tidak berlaku', { show_alert: true });
+    sess.data.osType = ctx.match[1];
+    setSession(ctx.from.id, sess);
+    return showReinstallOsChoice(ctx, sess);
+  });
+
+  bot.action(/^reinstall:linux:(.+):(.+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'reinstall') return;
@@ -1413,7 +1579,7 @@ Ketik /cancel untuk batal.`);
     await safeEdit(ctx, `🐧 OS: ${distro} ${version}\n\n` + text, { reply_markup: keyboard });
   });
 
-  bot.action(/reinstall:winpreset:(.+)/, async (ctx) => {
+  bot.action(/^reinstall:winpreset:(.+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'reinstall') return;
@@ -1430,7 +1596,7 @@ Ketik /cancel untuk batal.`);
   });
 
   // Confirmations
-  bot.action(/ssh:confirm/, async (ctx) => {
+  bot.action(/^ssh:confirm$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'setup_vps') return ctx.answerCbQuery('Sesi tidak berlaku', { show_alert: true });
@@ -1552,7 +1718,7 @@ Checklist:
         const trialNote = ui.isTrialAccount({ trial_mode: trialMode }) === true
           ? '\n\n🆓 <i>Akun ini masih free trial — VPS baru max 6 CPU & 12GB RAM (plan 🔒 tidak bisa dibuat).</i>'
           : '';
-        await ctx.telegram.editMessageText(ctx.chat.id, tempMsg.message_id, undefined, `✅ Akun <b>${username}</b> berhasil disimpan! ID: ${saved.id}${trialNote}`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '☁️ Lihat Akun', callback_data: 'mgr:upcloud' }]] } });
+        await ctx.telegram.editMessageText(ctx.chat.id, tempMsg.message_id, undefined, `✅ Akun <b>${validators.escapeHtml(username)}</b> berhasil disimpan! ID: ${saved.id}${trialNote}`, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '☁️ Lihat Akun', callback_data: 'mgr:upcloud' }]] } });
         clearSession(userId);
       } catch (e) {
         const client = new UpCloudClient('');
@@ -1630,8 +1796,8 @@ Yakin?`, { reply_markup: { inline_keyboard: [[{ text: '✅ Ya, rebuild', callbac
 
     // Create VPS: ask_name -> pilih IP version (IPv4 default)
     if (sess.type === 'create_vps' && sess.step === 'ask_name') {
-      const name = text.toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0,20);
-      if (name.length < 3) return safeReply(ctx, '❌ Nama terlalu pendek (min 3). Coba lagi.');
+      const name = validators.sanitizeHostname(text);
+      if (name.length < 3) return safeReply(ctx, '❌ Nama terlalu pendek (min 3, hanya huruf kecil/angka/dash). Coba lagi.');
       sess.data.serverName = name;
       sess.step = 'ask_ip_version';
       setSession(userId, sess);
@@ -1677,49 +1843,10 @@ Yakin?`, { reply_markup: { inline_keyboard: [[{ text: '✅ Ya, rebuild', callbac
       }
       sess.data.username = username;
       if (sess.type === 'check_vps') {
-        // Langsung eksekusi check
-        const chatId = ctx.chat.id;
-        const msg = await safeReply(ctx, `🔍 Check VPS ${sess.data.ip}...`);
-        const prog = new LiveProgress({ telegram: ctx.telegram }, chatId, msg.message_id, '🔍 Check VPS', 900);
-        prog.addStep('Koneksi SSH');
-        prog.addStep('Deteksi OS');
-        prog.addStep('Ambil konfigurasi SSH');
-        prog.addStep('Cek status layanan SSH');
-        prog.start();
+        // Check VPS tidak butuh password — langsung eksekusi (via helper yang sama dengan tombol)
         const sessData = { ...sess.data };
         clearSession(userId);
-        jobs.runDetached(userId, async () => {
-          let ssh = null;
-          try {
-            ssh = new SshSession({ host: sessData.ip, username: sessData.username, privateKey: sessData.privateKey, privateKeyPath: sessData.privateKeyPath });
-            prog.setRunning(0);
-            await ssh.connect();
-            prog.setDone(0, 'ok');
-            prog.setRunning(1);
-            const os = await require('./lib/osDetect').detectOS(ssh);
-            prog.setDone(1, `${os.id} ${os.versionId}`);
-            prog.setRunning(2);
-            const res = await ssh.exec('sshd -T 2>/dev/null | grep -E "^(port|passwordauthentication|permitrootlogin|pubkeyauthentication)"');
-            prog.setDone(2, 'ok');
-            prog.setRunning(3);
-            const res2 = await ssh.exec('systemctl is-active ssh 2>/dev/null || systemctl is-active sshd 2>/dev/null || service ssh status 2>/dev/null | head -n1');
-            prog.setDone(3, res2.stdout.trim().slice(0,20));
-            await prog.finish(`📋 <b>Laporan Check VPS</b>
-
-IP: ${sessData.ip}
-User: ${sessData.username}
-OS: ${os.id} ${os.versionId}
-Config:
-<pre>${res.stdout.slice(0,500)}</pre>
-Service: ${res2.stdout.slice(0,100)}
-`);
-          } catch (e) {
-            await prog.finish(`❌ Check gagal: ${validators.redactSecrets(e.message)}`);
-          } finally {
-            if (ssh) ssh.close();
-          }
-        });
-        return;
+        return runCheckVpsJob(ctx, sessData);
       }
       if (sess.type === 'setup_vps') {
         sess.step = 'ask_password';
@@ -1728,33 +1855,9 @@ Service: ${res2.stdout.slice(0,100)}
         return safeReply(ctx, pwText, { reply_markup: keyboard });
       }
       if (sess.type === 'reinstall') {
-        // Lanjut ke pilihan OS
-        if (sess.data.osType === 'linux') {
-          const text2 = `🐧 <b>Pilih Distro Linux</b>
-
-Pilih OS yang akan diinstall (SEMUA DATA DIHAPUS!):`;
-          const keyboard2 = {
-            inline_keyboard: [
-              [{ text: 'Debian 12', callback_data: 'reinstall:linux:debian:12' }, { text: 'Debian 13', callback_data: 'reinstall:linux:debian:13' }],
-              [{ text: 'Ubuntu 22.04', callback_data: 'reinstall:linux:ubuntu:22.04' }, { text: 'Ubuntu 24.04', callback_data: 'reinstall:linux:ubuntu:24.04' }],
-              [{ text: 'AlmaLinux 9', callback_data: 'reinstall:linux:almalinux:9' }, { text: 'Rocky Linux 9', callback_data: 'reinstall:linux:rocky:9' }],
-              [{ text: '❌ Batal', callback_data: 'wiz:cancel' }]
-            ]
-          };
-          return safeReply(ctx, text2, { reply_markup: keyboard2 });
-        } else {
-          // Windows
-          const text2 = `🪟 <b>Pilih ISO Windows</b>
-
-Pilih preset atau kirim link ISO sendiri:`;
-          const keyboard2 = { inline_keyboard: [] };
-          for (const p of config.WINDOWS_PRESETS) {
-            keyboard2.inline_keyboard.push([{ text: p.label, callback_data: `reinstall:winpreset:${p.label}` }]);
-          }
-          keyboard2.inline_keyboard.push([{ text: '🔗 Link ISO sendiri', callback_data: 'reinstall:win:customiso' }]);
-          keyboard2.inline_keyboard.push([{ text: '❌ Batal', callback_data: 'wiz:cancel' }]);
-          return safeReply(ctx, text2, { reply_markup: keyboard2 });
-        }
+        // Lanjut ke pilihan OS (helper yang sama dengan tombol)
+        setSession(userId, sess);
+        return showReinstallOsChoice(ctx, sess);
       }
     }
 
@@ -1825,7 +1928,7 @@ Aturan yang akan dibuat:
 • accept tcp 3389 dari ${range.start}-${range.end} (RDP)
 • accept tcp 80 dari mana saja (Web)
 • accept tcp 443 dari mana saja (Web TLS)
-• default incoming drop
+• ATURAN DEFAULT (terakhir): drop semua incoming lain
 • firewall ON
 
 ⚠️ <b>Anti-terkunci:</b> Kalau IP salah, kamu tidak bisa SSH/RDP sampai firewall dimatikan lewat bot atau Console VNC. Perubahan bisa butuh 1-2 menit. Bot sendiri tidak bisa masuk saat firewall aktif.
@@ -1856,6 +1959,8 @@ Yakin?`;
       sess.data.privateKeyPath = null;
       sess.step = 'await_ip';
       setSession(userId, sess);
+      // Shortcut dari Kelola VPS: IP sudah terisi → lewati permintaan IP
+      if (await proceedAfterKeySource(ctx, sess)) return;
       return safeReply(ctx, `✅ Private key diterima (disimpan di memori saja).
 
 Sekarang kirim IP/host VPS.`);
@@ -1921,6 +2026,8 @@ Sekarang pilih atau ketik <b>nama edisi</b> (image-name) untuk Windows.`, { repl
         sess.data.privateKeyPath = null;
         sess.step = 'await_ip';
         setSession(ctx.from.id, sess);
+        // Shortcut dari Kelola VPS: IP sudah terisi → lewati permintaan IP
+        if (await proceedAfterKeySource(ctx, sess)) return;
         return safeReply(ctx, `✅ Private key dari file diterima.
 
 Sekarang kirim IP/host VPS.`);
@@ -1967,7 +2074,7 @@ Yakin lanjut?${pwNote}`;
     else await safeReply(ctx, text, { reply_markup: keyboard });
   }
 
-  bot.action(/reinstall:win:customiso/, async (ctx) => {
+  bot.action(/^reinstall:win:customiso$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'reinstall') return;
@@ -1982,7 +2089,7 @@ Contoh: https://example.com/win.iso
 Ketik /cancel untuk batal.`);
   });
 
-  bot.action(/reinstall:image:(.+)/, async (ctx) => {
+  bot.action(/^reinstall:image:(.+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'reinstall') return;
@@ -2001,7 +2108,7 @@ Ketik /cancel untuk batal.`);
   });
 
   // Reinstall confirm execution
-  bot.action(/reinstall:confirm/, async (ctx) => {
+  bot.action(/^reinstall:confirm$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'reinstall') return ctx.answerCbQuery('Sesi tidak berlaku', { show_alert: true });
@@ -2074,8 +2181,7 @@ Ketik /cancel untuk batal.`);
 
         // Tunggu OS baru
         prog.setRunning(5, 'polling...');
-        prog.tickMs = 20000;
-        prog.start(); // restart with longer tick
+        prog.setTickMs(20000); // restart timer dengan interval lebih panjang (fase polling 20-40 menit)
         if (sessData.osType === 'linux') {
           const factory = async (pw) => new SshSession({ host: sessData.ip, username: 'root', password: pw });
           const waitRes = await reinstallFlow.waitForLinux(factory, sessData.password, sessData.distro === 'debian' ? 'debian' : sessData.distro === 'ubuntu' ? 'ubuntu' : sessData.distro, pre.bootId, 40*60*1000);
@@ -2104,7 +2210,7 @@ Cara login: <code>ssh root@${sessData.ip}</code>
 IP: <code>${sessData.ip}:3389</code>
 User: Administrator
 Password: <code>${sessData.password}</code>
-OS: ${sessData.osLabel}
+OS: ${sessData.osLabel || sessData.imageName || 'Windows'}
 Image: ${sessData.imageName}
 
 Cara login: aplikasi Remote Desktop ke ${sessData.ip}:3389
@@ -2131,7 +2237,7 @@ Jika VPS macet, gunakan 🖥 Console (VNC) di menu Kelola VPS untuk pulihkan.
   });
 
   // Firewall confirm
-  bot.action(/fw:confirm/, async (ctx) => {
+  bot.action(/^fw:confirm$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'firewall') return;
@@ -2147,10 +2253,13 @@ Jika VPS macet, gunakan 🖥 Console (VNC) di menu Kelola VPS untuk pulihkan.
         { action: 'accept', direction: 'in', family: 'IPv4', protocol: 'tcp', destination_port_start: '22', destination_port_end: '22', source_address_start: range.start, source_address_end: range.end, comment: 'SSH dari IP saya' },
         { action: 'accept', direction: 'in', family: 'IPv4', protocol: 'tcp', destination_port_start: '3389', destination_port_end: '3389', source_address_start: range.start, source_address_end: range.end, comment: 'RDP dari IP saya' },
         { action: 'accept', direction: 'in', family: 'IPv4', protocol: 'tcp', destination_port_start: '80', destination_port_end: '80', comment: 'Web' },
-        { action: 'accept', direction: 'in', family: 'IPv4', protocol: 'tcp', destination_port_start: '443', destination_port_end: '443', comment: 'Web TLS' }
+        { action: 'accept', direction: 'in', family: 'IPv4', protocol: 'tcp', destination_port_start: '443', destination_port_end: '443', comment: 'Web TLS' },
+        // Aturan Default WAJIB di posisi terakhir: tolak semua incoming lain.
+        // Per dok UpCloud, Default Rule cukup direction+action (tanpa family/protocol/alamat/port).
+        { action: 'drop', direction: 'in', comment: 'Default: tolak lainnya' }
       ];
       await client.setFirewallRules(uuid, rules);
-      await client.setFirewallStatus(uuid, true, 'drop');
+      await client.setFirewallStatus(uuid, true);
       await safeEdit(ctx, `✅ Firewall dikunci ke ${ipInput} (${range.start}-${range.end}) untuk SSH/RDP. Perubahan bisa butuh 1-2 menit.`, { reply_markup: { inline_keyboard: [[{ text: '⬅️ Kembali', callback_data: `srv:${accId}:${uuid}` }]] } });
       clearSession(ctx.from.id);
     } catch (e) {
@@ -2160,7 +2269,7 @@ Jika VPS macet, gunakan 🖥 Console (VNC) di menu Kelola VPS untuk pulihkan.
   });
 
   // Firewall off
-  bot.action(/srvact:([a-f0-9]{6}):([a-f0-9-]{36}):fw:off/, async (ctx) => {
+  bot.action(/^srvact:([a-f0-9]{6}):([a-f0-9-]{36}):fw:off$/, async (ctx) => {
     await ctx.answerCbQuery();
     const accId = ctx.match[1];
     const uuid = ctx.match[2];
@@ -2176,7 +2285,7 @@ Jika VPS macet, gunakan 🖥 Console (VNC) di menu Kelola VPS untuk pulihkan.
     }
   });
   // Handle fw off callback with space (legacy)
-  bot.action(/srvact:([a-f0-9]{6}):([a-f0-9-]{36}):fw off/, async (ctx) => {
+  bot.action(/^srvact:([a-f0-9]{6}):([a-f0-9-]{36}):fw off$/, async (ctx) => {
     await ctx.answerCbQuery();
     const accId = ctx.match[1];
     const uuid = ctx.match[2];
@@ -2193,7 +2302,7 @@ Jika VPS macet, gunakan 🖥 Console (VNC) di menu Kelola VPS untuk pulihkan.
   });
 
   // Rebuild official confirm
-  bot.action(/rebuild:confirm/, async (ctx) => {
+  bot.action(/^rebuild:confirm$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'rebuild') return ctx.answerCbQuery('Sesi tidak berlaku', { show_alert: true });
@@ -2326,8 +2435,7 @@ Jika VPS macet, gunakan 🖥 Console (VNC) di menu Kelola VPS untuk pulihkan.
           await sshPw.exec('whoami');
           sshPw.close();
           // Hapus key bot
-          const delCmd = `sed -i '/upcloud-ssh-bot/d' /root/.ssh/authorized_keys; echo ok`;
-          await ssh.exec(delCmd);
+          await ssh.exec(buildRemoveBotKeyCmd('/root/.ssh/authorized_keys'));
           ssh.close();
           prog.setDone(6, 'password ok & key dihapus');
         } else {
@@ -2344,7 +2452,7 @@ Jika VPS macet, gunakan 🖥 Console (VNC) di menu Kelola VPS untuk pulihkan.
 
         await prog.finish(`✅ <b>Reinstall Resmi Berhasil</b>
 
-VPS: ${finalSrv.title}
+VPS: ${validators.escapeHtml(finalSrv.title)}
 UUID: ${sessData.serverUuid}
 IP: <code>${serverIp}</code>
 OS: ${sessData.osTitle}
@@ -2368,43 +2476,8 @@ VPS mungkin masih ada dan ditagih. Cek di Kelola VPS.
 
   // Rebuild password & pubkey flows (text handlers extension)
   // These are handled in generic text handler but need confirm steps
-  bot.action(/rebuild:pw:(random|custom|default)/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const sess = getSession(ctx.from.id);
-    if (!sess || sess.type !== 'rebuild') return;
-    const choice = ctx.match[1];
-    if (choice === 'random') {
-      sess.data.password = passwordLib.generateRandom(16, false);
-      sess.data.passwordChoice = 'random';
-      sess.step = 'confirm';
-      setSession(ctx.from.id, sess);
-      const text = `🔁 <b>Konfirmasi Rebuild</b>
-
-VPS: ${sess.data.serverUuid}
-OS: ${sess.data.osTitle}
-Login: password acak
-Password: akan ditampilkan
-
-⚠️ SEMUA DATA DIHAPUS PERMANEN!
-
-Yakin?`;
-      await safeEdit(ctx, text, { reply_markup: { inline_keyboard: [[{ text: '✅ Ya, rebuild', callback_data: 'rebuild:confirm' }], [{ text: '❌ Batal', callback_data: 'wiz:cancel' }]] } });
-    } else if (choice === 'custom') {
-      sess.step = 'await_custom_password';
-      setSession(ctx.from.id, sess);
-      await safeEdit(ctx, 'Ketik password custom (akan dihapus).');
-    } else {
-      if (!isOwner(ctx.from.id) && !config.DEFAULT_PASSWORD_FOR_EVERYONE) return ctx.answerCbQuery('Hanya owner', { show_alert: true });
-      sess.data.password = config.DEFAULT_PASSWORD;
-      sess.step = 'confirm';
-      setSession(ctx.from.id, sess);
-      await safeEdit(ctx, `🔁 Konfirmasi rebuild dengan password default.\n\nYakin?`, { reply_markup: { inline_keyboard: [[{ text: '✅ Ya', callback_data: 'rebuild:confirm' }], [{ text: '❌ Batal', callback_data: 'wiz:cancel' }]] } });
-    }
-  });
-
-
   // Create VPS confirm
-  bot.action(/wiz:confirm:create/, async (ctx) => {
+  bot.action(/^wiz:confirm:create$/, async (ctx) => {
     await ctx.answerCbQuery();
     const sess = getSession(ctx.from.id);
     if (!sess || sess.type !== 'create_vps') return ctx.answerCbQuery('Sesi tidak berlaku', { show_alert: true });
@@ -2553,8 +2626,7 @@ Yakin?`;
 
           prog.setRunning(5, 'hapus key bot');
           // Hapus public key bot dari authorized_keys
-          const delCmd = `sed -i '/upcloud-ssh-bot/d' /root/.ssh/authorized_keys 2>/dev/null; sed -i '/${botPublicKey.split(' ')[1].slice(0,20)}/d' /root/.ssh/authorized_keys 2>/dev/null; echo ok`;
-          const delRes = await ssh.exec(delCmd);
+          const delRes = await ssh.exec(buildRemoveBotKeyCmd('/root/.ssh/authorized_keys'));
           ssh.close();
           prog.setDone(5, 'key bot dihapus');
 

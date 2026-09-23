@@ -151,6 +151,7 @@ WINDOWS_PRESETS=[5 preset]
 ```
 
 ### Firewall
+Catatan API 1.3: **tidak ada atribut server `firewall_public_default_incoming_action`**. "Default Rule" (Default Rule di Control Panel) adalah **aturan TERAKHIR** pada chain dan cukup berisi `direction` + `action` (tanpa family/protocol/alamat/port). Karena itu aturan drop semua harus ditambahkan di posisi terakhir:
 ```json
 {
   "firewall_rules": {
@@ -158,11 +159,13 @@ WINDOWS_PRESETS=[5 preset]
       { "action": "accept", "direction": "in", "family": "IPv4", "protocol": "tcp", "destination_port_start": "22", "destination_port_end": "22", "source_address_start": "203.0.113.5", "source_address_end": "203.0.113.5", "comment": "SSH dari IP saya" },
       { "action": "accept", "direction": "in", "family": "IPv4", "protocol": "tcp", "destination_port_start": "3389", "destination_port_end": "3389", "source_address_start": "203.0.113.5", "source_address_end": "203.0.113.5", "comment": "RDP dari IP saya" },
       { "action": "accept", "direction": "in", "family": "IPv4", "protocol": "tcp", "destination_port_start": "80", "destination_port_end": "80", "comment": "Web" },
-      { "action": "accept", "direction": "in", "family": "IPv4", "protocol": "tcp", "destination_port_start": "443", "destination_port_end": "443", "comment": "Web TLS" }
+      { "action": "accept", "direction": "in", "family": "IPv4", "protocol": "tcp", "destination_port_start": "443", "destination_port_end": "443", "comment": "Web TLS" },
+      { "action": "drop", "direction": "in", "comment": "Default: tolak lainnya" }
     ]
   }
 }
 ```
+Lalu nyalakan firewall via modify server: `PUT /1.3/server/{uuid}` body `{ "server": { "firewall": "on" } }`.
 
 ## Pengujian
 
@@ -173,13 +176,16 @@ node tests/run.js
 ```
 
 Tes mencakup:
-- Validator IP/CIDR/username/password/SSH key, shellEscape, redactSecrets, cidrToRange.
+- Validator IP/CIDR/username/password/SSH key, shellEscape, redactSecrets, cidrToRange, escapeHtml, sanitizeHostname.
 - Password generate & pilihan owner vs user.
 - Vault encrypt/decrypt AAD isolation, multi-akun, kepemilikan, /hapusdata.
 - Quota reset harian, owner unlimited.
 - Jobs: 1 per user & max concurrent.
-- Callback_data ≤64 byte & stateless.
-- Payload emas buat VPS, rebuild, firewall.
+- Callback_data ≤64 byte & stateless (termasuk regresi tombol hapus VPS yang dulu 65 byte).
+- Routing callback: semua regex ter-anchor `^...$` & first-match mengarah ke handler yang benar (regresi tombol konfirmasi yang dulu tertelan regex lain).
+- LiveProgress: escape HTML checklist & start() idempotent + setTickMs merestart interval.
+- Payload emas buat VPS, rebuild, firewall (dengan Default Rule drop di akhir chain).
+- Provider API: VNC via `GET /1.3/server/{uuid}` + `remote_access_*` (bukan endpoint palsu `/vnc_details`), setFirewall hanya atribut `firewall` on/off, billing summary fallback endpoint deprecated saat 404 + parsing defensif.
 - Translate error 401/403/429 ramah.
 - Cek API expiring ≤7 hari.
 - Keygen ED25519 + ssh2 parse (opsional jika modul ada).

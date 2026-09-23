@@ -1,6 +1,7 @@
 /**
  * ui/manager.js - UI helper untuk Manajer Akun UpCloud
  */
+const { escapeHtml: esc } = require('../lib/validators');
 
 function mainMenu() {
   const text = `👋 <b>Selamat datang di UpCloud VPS Manager!</b>
@@ -60,7 +61,7 @@ Pilih akun untuk kelola, atau tambah akun baru.
   }
   const keyboard = { inline_keyboard: [] };
   for (const acc of accounts) {
-    keyboard.inline_keyboard.push([{ text: `🔑 ${acc.label} (${acc.username})`, callback_data: `mgr:acc:${acc.id}` }]);
+    keyboard.inline_keyboard.push([{ text: `🔑 ${acc.label} (${esc(acc.username)})`, callback_data: `mgr:acc:${acc.id}` }]);
   }
   keyboard.inline_keyboard.push([{ text: '➕ Tambah Akun (API Token)', callback_data: 'mgr:upcloud:add' }]);
   keyboard.inline_keyboard.push([{ text: '🔐 Cek API (semua akun)', callback_data: 'mgr:upcloud:checkall' }]);
@@ -74,9 +75,9 @@ function accountDetailMenu(account) {
   const trialLine = trial === true ? 'Status: 🆓 <b>Free trial</b> (VPS baru max 6 CPU & 12GB RAM)'
     : trial === false ? 'Status: Reguler (bukan free trial)'
     : '';
-  const text = `🔑 <b>Akun: ${account.label}</b>
-Username: <code>${account.username}</code>
-ID: <code>${account.id}</code>
+  const text = `🔑 <b>Akun: ${esc(account.label)}</b>
+Username: <code>${esc(account.username)}</code>
+ID: <code>${esc(account.id)}</code>
 Provider: UpCloud
 ${trialLine ? trialLine + '\n' : ''}
 Pilih aksi:`;
@@ -384,7 +385,7 @@ Pilih VPS untuk detail & aksi:
     if (s.state === 'started') icon = '🟢';
     else if (s.state === 'stopped') icon = '🔴';
     else if (s.state === 'maintenance') icon = '🟡';
-    const label = `${icon} ${s.title} (${s.zone})`.slice(0, 40);
+    const label = `${icon} ${esc(s.title)} (${esc(s.zone)})`.slice(0, 40);
     // callback_data ≤64: srv:<acc6>:<uuid>
     keyboard.inline_keyboard.push([{ text: label, callback_data: `srv:${accountId}:${s.uuid}` }]);
   }
@@ -398,13 +399,13 @@ function formatServerDetail(server, accountId) {
   const ipv4 = ips.filter(ip => ip.access === 'public' && ip.family === 'IPv4').map(ip=>ip.address).join(', ') || 'belum ada';
   const text = `🖥 <b>Detail VPS</b>
 
-<b>${server.title}</b> (${server.state})
-Hostname: <code>${server.hostname}</code>
+<b>${esc(server.title)}</b> (${esc(server.state)})
+Hostname: <code>${esc(server.hostname)}</code>
 UUID: <code>${server.uuid}</code>
 Zona: ${server.zone}
 Plan: ${server.plan}
 vCPU: ${server.core_number} | RAM: ${server.memory_amount} MB
-IPv4 Publik: <code>${ipv4}</code>
+IPv4 Publik: <code>${esc(ipv4)}</code>
 Firewall: ${server.firewall || 'off'} | Remote Access: ${server.remote_access_enabled || 'no'}
 
 Pilih aksi:
@@ -429,9 +430,9 @@ Pilih aksi:
 function formatBilling(account, billingCurrent, billingLast, servers) {
   const started = servers.filter(s=>s.state==='started').length;
   const stopped = servers.filter(s=>s.state==='stopped').length;
-  let text = `💰 <b>Tagihan & Saldo - ${account.label}</b>
+  let text = `💰 <b>Tagihan & Saldo - ${esc(account.label)}</b>
 
-Username: <code>${account.username}</code>
+Username: <code>${esc(account.username)}</code>
 Saldo Kredit: ${account.credits !== undefined ? account.credits : 'N/A'}
 
 <b>Tagihan:</b>
@@ -462,7 +463,7 @@ Bot cek semua akun tersimpan:
     let detail = '';
     if (r.status === 'ok') {
       icon = '✅ Hidup';
-      detail = `${r.username}${r.trial ? ' | 🆓 free trial' : ''}`;
+      detail = `${esc(r.username)}${r.trial ? ' | 🆓 free trial' : ''}`;
       if (r.tokens) {
         detail += ` | ${r.tokens.length} token`;
         // Cek kedaluwarsa ≤7 hari
@@ -483,14 +484,14 @@ Bot cek semua akun tersimpan:
       detail = `Cek Allowed IP, IP bot: ${botIp}`;
     } else {
       icon = '⚠️ Gagal terhubung';
-      detail = r.error || 'coba cek ulang';
+      detail = esc(r.error || 'coba cek ulang');
     }
-    text += `${icon} <b>${r.label}</b> (${r.id}): ${detail}\n`;
+    text += `${icon} <b>${esc(r.label)}</b> (${esc(r.id)}): ${detail}\n`;
     if (r.tokens && r.tokens.length > 0) {
       for (const t of r.tokens.slice(0,3)) {
         const exp = t.expires_at ? new Date(t.expires_at).toLocaleDateString() : 'no exp';
         const last = t.last_used_at ? new Date(t.last_used_at).toLocaleDateString() : 'belum pernah';
-        text += `  - ${t.name}: exp ${exp}, last ${last}\n`;
+        text += `  - ${esc(t.name)}: exp ${exp}, last ${last}\n`;
       }
       if (r.tokens.length > 3) text += `  ... dan ${r.tokens.length-3} lagi\n`;
     }
@@ -508,11 +509,16 @@ Bot cek semua akun tersimpan:
 }
 
 function formatFirewallStatus(server, rules, accountId) {
-  const text = `🛡 <b>Firewall VPS ${server.title}</b>
+  // Per dok UpCloud: Default Rule = aturan TERAKHIR dalam chain, hanya direction+action.
+  // Deteksi dari daftar aturan (bukan atribut server, karena atribut itu tidak ada di API).
+  const safeRules = Array.isArray(rules) ? rules : [];
+  const defaultIn = safeRules.find(r => (r.direction === 'in' || r.direction === '') && !r.protocol && !r.family);
+  const defaultLabel = defaultIn ? defaultIn.action.toUpperCase() : 'accept (belum ada aturan default)';
+  const text = `🛡 <b>Firewall VPS ${esc(server.title)}</b>
 
 Status: <b>${server.firewall === 'on' ? 'ON (aktif)' : 'OFF (mati)'}</b>
-Jumlah aturan: ${rules.length}
-Default incoming: ${server.firewall_public_default_incoming_action || 'accept'}
+Jumlah aturan: ${safeRules.length}
+Default incoming (aturan terakhir): <b>${defaultLabel}</b>
 
 <b>Tujuan:</b> Mengurangi serangan brute force dengan kunci SSH (22) & RDP (3389) hanya ke IP-mu.
 
@@ -520,13 +526,14 @@ Default incoming: ${server.firewall_public_default_incoming_action || 'accept'}
 • Kalau IP salah, kamu tidak bisa SSH/RDP sampai firewall dimatikan (bisa lewat bot atau Console VNC)
 • Perubahan aturan bisa butuh 1-2 menit
 • Bot sendiri tidak bisa masuk ke VPS (Setup/Reinstall via SSH) saat firewall aktif!
+• Akun free trial UpCloud bisa MENOLAK mematikan firewall (TRIAL_FIREWALL).
 
 Pilih aksi:
 `;
   const keyboard = {
     inline_keyboard: [
       [{ text: '🔒 Kunci SSH/RDP ke IP-ku', callback_data: `srvact:${accountId}:${server.uuid}:fwlock` }],
-      [{ text: '🔓 Matikan Firewall', callback_data: `srvact:${accountId}:${server.uuid}:fw off` }],
+      [{ text: '🔓 Matikan Firewall', callback_data: `srvact:${accountId}:${server.uuid}:fw:off` }],
       [{ text: '⬅️ Kembali', callback_data: `srv:${accountId}:${server.uuid}` }]
     ]
   };
