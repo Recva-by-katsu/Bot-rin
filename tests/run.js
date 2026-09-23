@@ -349,6 +349,82 @@ ok('cek API: peringatan kedaluwarsa ≤7 hari', () => {
   assert(expiring.length === 2); // token1 dan token3
 });
 
+// === Free trial limit plan (max 6 CPU & 12GB RAM) ===
+ok('free trial: isWithinFreeTrial batas 6 CPU & 12GB', () => {
+  const uiMod = require('../ui/manager');
+  assert(uiMod.isWithinFreeTrial({ core_number: 6, memory_amount: 12288 }) === true);  // persis di batas
+  assert(uiMod.isWithinFreeTrial({ core_number: 1, memory_amount: 1024 }) === true);   // starter 1GB
+  assert(uiMod.isWithinFreeTrial({ core_number: 4, memory_amount: 8192 }) === true);   // CN 4GB
+  assert(uiMod.isWithinFreeTrial({ core_number: 8, memory_amount: 16384 }) === false); // 8 CPU
+  assert(uiMod.isWithinFreeTrial({ core_number: 6, memory_amount: 16384 }) === false); // 16GB RAM
+  assert(uiMod.isWithinFreeTrial({ core_number: 2, memory_amount: 12800 }) === false); // 12.5GB RAM
+  assert(uiMod.isWithinFreeTrial({ core_number: 4, memory_amount: 24576 }) === false); // CN 24GB
+});
+
+ok('free trial: label plan 🔒 di formatPlans', () => {
+  const uiMod = require('../ui/manager');
+  const plans = [
+    { name: '1xCPU-1GB-25GB', core_number: 1, memory_amount: 1024, storage_size: 25, storage_tier: 'maxiops', gpu_amount: 0, price: 5, current_offering: 'yes' },
+    { name: '2xCPU-16GB-150GB', core_number: 2, memory_amount: 16384, storage_size: 150, storage_tier: 'maxiops', gpu_amount: 0, price: 72, current_offering: 'yes' },
+    { name: '8xCPU-16GB-200GB', core_number: 8, memory_amount: 16384, storage_size: 200, storage_tier: 'maxiops', gpu_amount: 0, price: 148, current_offering: 'yes' }
+  ];
+  const { text, keyboard } = uiMod.formatPlans(plans, 'premium');
+  const labels = keyboard.inline_keyboard.map(r => r[0].text);
+  assert(labels[0].includes('⭐') && !labels[0].includes('🔒'), `plan 1GB: ⭐ tanpa 🔒 -> ${labels[0]}`);
+  assert(labels[1].includes('🔒'), `plan 2x16GB harus 🔒 -> ${labels[1]}`);
+  assert(labels[2].includes('🔒'), `plan 8x16GB harus 🔒 -> ${labels[2]}`);
+  assert(text.includes('free trial'), 'teks list plan menjelaskan limit free trial');
+});
+
+ok('free trial: isTrialAccount membaca trial_mode (tri-state)', () => {
+  const uiMod = require('../ui/manager');
+  assert(uiMod.isTrialAccount({ trial_mode: '1' }) === true, 'string "1" = trial');
+  assert(uiMod.isTrialAccount({ trial_mode: '0' }) === false, 'string "0" = bukan');
+  assert(uiMod.isTrialAccount({ trial_mode: 1 }) === true, 'number 1 = trial');
+  assert(uiMod.isTrialAccount({ trial_mode: 0 }) === false, 'number 0 = bukan');
+  assert(uiMod.isTrialAccount({}) === undefined, 'tanpa field = unknown');
+  assert(uiMod.isTrialAccount(null) === undefined, 'null = unknown');
+});
+
+ok('free trial: formatPlanCategories sesuai status trial akun', () => {
+  const uiMod = require('../ui/manager');
+  const plans = [
+    { name: '1xCPU-1GB-10GB', core_number: 1, memory_amount: 1024, storage_size: 10, storage_tier: 'hdd', price: 3, current_offering: 'yes' },
+    { name: '2xCPU-16GB-150GB', core_number: 2, memory_amount: 16384, storage_size: 150, storage_tier: 'maxiops', price: 72, current_offering: 'yes' }
+  ];
+  const t = uiMod.formatPlanCategories(plans, true).text;
+  assert(t.includes('MASIH FREE TRIAL'), 'akun trial -> peringatan khusus');
+  const f = uiMod.formatPlanCategories(plans, false).text;
+  assert(f.includes('bukan free trial'), 'akun reguler -> info bisa pilih 🔒');
+  const u = uiMod.formatPlanCategories(plans).text;
+  assert(!u.includes('MASIH FREE TRIAL') && !u.includes('bukan free trial'), 'status unknown -> tanpa tambahan');
+});
+
+ok('vault: trial_mode tersimpan di akun + updateAccountMeta', () => {
+  const accFile = path.join(__dirname, '..', 'data', 'accounts.json');
+  const backup = fs.existsSync(accFile) ? fs.readFileSync(accFile, 'utf8') : null;
+  const config = { ENCRYPTION_KEY: 'testkey1234567890123456789012345678' };
+  const vault = new Vault(config);
+  try {
+    if (fs.existsSync(accFile)) fs.unlinkSync(accFile);
+    // Add dengan meta trial_mode
+    const acc = vault.addOrUpdateAccount(222, 'ucat_t', 'trialuser', 'trialuser', { trial_mode: '1' });
+    assert(acc.trial_mode === '1', 'trial_mode tersimpan saat add');
+    // Update meta tanpa menyentuh token
+    const before = vault.getDecryptedToken(222, acc.id);
+    const updated = vault.updateAccountMeta(222, acc.id, { trial_mode: '0' });
+    assert(updated.trial_mode === '0', 'trial_mode diupdate');
+    assert(vault.getDecryptedToken(222, acc.id) === before, 'token tidak berubah');
+    // Meta undefined tidak menimpa nilai lama
+    const u2 = vault.updateAccountMeta(222, acc.id, { trial_mode: undefined });
+    assert(u2.trial_mode === '0', 'undefined tidak menimpa');
+    assert(vault.updateAccountMeta(222, 'aaaaaa', { trial_mode: '1' }) === null, 'akun tidak ada -> null');
+  } finally {
+    if (backup) fs.writeFileSync(accFile, backup);
+    else if (fs.existsSync(accFile)) fs.unlinkSync(accFile);
+  }
+});
+
 // === Test keygen ===
 okAsync('keygen: ED25519 generate & ssh2 parse (opsional jika ssh2 ada)', async () => {
   const tmpKeysDir = path.join(__dirname, '..', 'data', 'keys_test');
