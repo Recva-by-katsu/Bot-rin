@@ -13,7 +13,7 @@ Bot Telegram ramah pemula untuk mengelola VPS UpCloud. Multi-user & multi-akun: 
   - Tambah akun: input token `ucat_...`, validasi `GET /1.3/account`, error 401/403/429 ramah + tampilkan IP bot (`BOT_PUBLIC_IP` auto-detect via ipify 5s timeout) untuk allowed_ip.
   - Buat VPS wizard:
     - Pilih zona: filter `public=yes`, tampilkan ⭐ untuk `sg-` (Singapore dekat Indonesia), paginasi.
-    - Pilih plan: buang GPU (`gpu_amount>0`) dan `current_offering=no`, urut naik core/memory/storage, maks 10 per halaman, ⭐ rekomendasi `RAM≥1GB`.
+    - Pilih plan: buang GPU (`gpu_amount>0`) dan `current_offering=no`, urut naik core/memory/storage, maks 10 per halaman, ⭐ rekomendasi `RAM≥1GB`, grup kategori Starter/Premium/Cloud Native (heuristik nama + storage). Plan di luar limit free trial (max 6 CPU & 12GB RAM) ditandai 🔒 + peringatan di layar konfirmasi.
     - Pilih login: **Password Otomatis** (buat dengan key bot → setup password → tes login → hapus key bot) atau **SSH Key sendiri** (PEM ≤32KB, pesan dihapus setelah input).
     - Pilih OS: dari `/1.3/storage/template` paginasi, buang `access=private` + Windows (title mengandung Windows), tampil size & tier.
     - Konfirmasi biaya per jam (dari plan `price`), eksekusi detached dengan LiveProgress checklist animasi.

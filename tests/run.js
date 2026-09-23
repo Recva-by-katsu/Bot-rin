@@ -349,6 +349,33 @@ ok('cek API: peringatan kedaluwarsa ≤7 hari', () => {
   assert(expiring.length === 2); // token1 dan token3
 });
 
+// === Free trial limit plan (max 6 CPU & 12GB RAM) ===
+ok('free trial: isWithinFreeTrial batas 6 CPU & 12GB', () => {
+  const uiMod = require('../ui/manager');
+  assert(uiMod.isWithinFreeTrial({ core_number: 6, memory_amount: 12288 }) === true);  // persis di batas
+  assert(uiMod.isWithinFreeTrial({ core_number: 1, memory_amount: 1024 }) === true);   // starter 1GB
+  assert(uiMod.isWithinFreeTrial({ core_number: 4, memory_amount: 8192 }) === true);   // CN 4GB
+  assert(uiMod.isWithinFreeTrial({ core_number: 8, memory_amount: 16384 }) === false); // 8 CPU
+  assert(uiMod.isWithinFreeTrial({ core_number: 6, memory_amount: 16384 }) === false); // 16GB RAM
+  assert(uiMod.isWithinFreeTrial({ core_number: 2, memory_amount: 12800 }) === false); // 12.5GB RAM
+  assert(uiMod.isWithinFreeTrial({ core_number: 4, memory_amount: 24576 }) === false); // CN 24GB
+});
+
+ok('free trial: label plan 🔒 di formatPlans', () => {
+  const uiMod = require('../ui/manager');
+  const plans = [
+    { name: '1xCPU-1GB-25GB', core_number: 1, memory_amount: 1024, storage_size: 25, storage_tier: 'maxiops', gpu_amount: 0, price: 5, current_offering: 'yes' },
+    { name: '2xCPU-16GB-150GB', core_number: 2, memory_amount: 16384, storage_size: 150, storage_tier: 'maxiops', gpu_amount: 0, price: 72, current_offering: 'yes' },
+    { name: '8xCPU-16GB-200GB', core_number: 8, memory_amount: 16384, storage_size: 200, storage_tier: 'maxiops', gpu_amount: 0, price: 148, current_offering: 'yes' }
+  ];
+  const { text, keyboard } = uiMod.formatPlans(plans, 'premium');
+  const labels = keyboard.inline_keyboard.map(r => r[0].text);
+  assert(labels[0].includes('⭐') && !labels[0].includes('🔒'), `plan 1GB: ⭐ tanpa 🔒 -> ${labels[0]}`);
+  assert(labels[1].includes('🔒'), `plan 2x16GB harus 🔒 -> ${labels[1]}`);
+  assert(labels[2].includes('🔒'), `plan 8x16GB harus 🔒 -> ${labels[2]}`);
+  assert(text.includes('free trial'), 'teks list plan menjelaskan limit free trial');
+});
+
 // === Test keygen ===
 okAsync('keygen: ED25519 generate & ssh2 parse (opsional jika ssh2 ada)', async () => {
   const tmpKeysDir = path.join(__dirname, '..', 'data', 'keys_test');

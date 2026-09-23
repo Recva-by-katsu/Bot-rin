@@ -719,6 +719,10 @@ Yakin mau hapus akun ini dari bot? Token tetap ada di UpCloud, hanya dihapus dar
     const planInfo = sess.data.plan;
     const osInfo = sess.data.osTitle || sess.data.osTemplateUuid;
     const ipLabel = sess.data.ipVersion === 'dual' ? 'IPv4 + IPv6 (dual)' : 'IPv4 saja (default)';
+    const planObj = (sess.data.allPlans || []).find(p => p.name === sess.data.plan);
+    const trialWarn = (planObj && !ui.isWithinFreeTrial(planObj))
+      ? '\n🔒 <b>Plan ini di luar limit free trial (max 6 CPU & 12GB RAM).</b> Kalau akunmu masih trial, UpCloud akan menolak pembuatannya — lebih aman pilih plan tanpa 🔒.'
+      : '';
     const confirmText = `📋 <b>Konfirmasi Buat VPS</b>
 
 Akun: ${sess.data.accountId}
@@ -732,6 +736,7 @@ ${sess.data.loginMode === 'password' ? `Password: ${sess.data.passwordChoice ===
 
 ⚠️ <b>Peringatan biaya:</b> VPS ditagih per jam sampai <b>dihapus</b>. VPS yang hanya di-Stop umumnya tetap ditagih karena resource masih dialokasikan.
 ${sess.data.ipVersion === 'dual' ? '\nℹ️ Dual stack: VPS akan dapat IPv4 publik + IPv6 publik.' : '\nℹ️ Default: VPS hanya IPv4 publik (paling kompatibel).'}
+${trialWarn}
 
 Yakin buat VPS?`;
     const keyboard = { inline_keyboard: [[{ text: '✅ Ya, buat VPS', callback_data: 'wiz:confirm:create' }], [{ text: '❌ Batal', callback_data: 'wiz:cancel' }]] };
