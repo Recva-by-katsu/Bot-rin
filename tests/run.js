@@ -453,6 +453,152 @@ okAsync('keygen: ED25519 generate & ssh2 parse (opsional jika ssh2 ada)', async 
   fs.rmSync(tmpKeysDir, { recursive: true, force: true });
 });
 
+// ============================================================
+// REGRESI — bug yang ditemukan & diperbaiki (jangan sampai kembali)
+// ============================================================
+
+// --- Regresi: helper validators baru ---
+ok('validators: escapeHtml', () => {
+  assert(validators.escapeHtml('<b>x</b> & "y"') === '&lt;b&gt;x&lt;/b&gt; &amp; "y"');
+  assert(validators.escapeHtml('') === '');
+  assert(validators.escapeHtml(null) === '');
+  assert(validators.escapeHtml(123) === '123');
+});
+
+ok('validators: sanitizeHostname', () => {
+  assert(validators.sanitizeHostname('My VPS_01!') === 'my-vps-01');
+  assert(validators.sanitizeHostname('--abc--') === 'abc');
+  assert(validators.sanitizeHostname('a-b-c') === 'a-b-c');
+  assert(validators.sanitizeHostname('Nama Sangat Panjang Sekali Banget').length <= 20);
+  assert(validators.sanitizeHostname('!!!') === '');
+  assert(/^[a-z0-9][a-z0-9-]*$/.test(validators.sanitizeHostname('  Test.OK 123 ')));
+});
+
+// --- Regresi: routing callback_data (bug regex prefix swallowing) ---
+ok('routing: semua regex bot.action ter-anchor (^...$)', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+  const bodies = [...src.matchAll(/bot\.action\(\/(.+?)\/[a-z]*,/gs)].map(m => m[1]);
+  assert(bodies.length >= 50, `handler terlalu sedikit: ${bodies.length}`);
+  for (const b of bodies) {
+    assert(b.startsWith('^'), `regex tidak diawali ^: ${b}`);
+    assert(b.endsWith('$'), `regex tidak diakhiri $: ${b}`);
+  }
+});
+
+ok('routing: first-match callback mengarah ke handler yang benar', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+  const handlers = [...src.matchAll(/bot\.action\(\/(.+?)\/[a-z]*,/gs)].map(m => new RegExp(m[1]));
+  function firstMatch(data) {
+    for (const h of handlers) if (data.match(h)) return h.source;
+    return null;
+  }
+  const uuid = '00aa11bb-22cc-33dd-44ee-55ff66778899';
+  const acc = 'a1b2c3';
+  const MAIN = ':(start|stop|restart|delete|vnc|ssh|os|rebuild|fw|fwlock)$';
+  const cases = [
+    [`srv:${acc}:${uuid}`, '^srv:([a-f0-9]{6}):([a-f0-9-]{36})$'],
+    [`srvact:${acc}:${uuid}:start`, MAIN],
+    [`srvact:${acc}:${uuid}:delete`, MAIN],
+    [`srvact:${acc}:${uuid}:delc`, ':delc$'],              // BUG: dulu 65-byte ':delete:confirm' + ketelan regex utama
+    [`srvact:${acc}:${uuid}:vnc`, MAIN],
+    [`srvact:${acc}:${uuid}:vnc:enable`, ':vnc:enable$'], // BUG: dulu ketelan handler utama (vnc)
+    [`srvact:${acc}:${uuid}:fw`, MAIN],
+    [`srvact:${acc}:${uuid}:fwlock`, MAIN],
+    [`srvact:${acc}:${uuid}:fw:off`, ':fw:off$'],         // BUG: dulu ketelan handler utama (fw)
+    [`srvact:${acc}:${uuid}:fw off`, ':fw off$'],         // legacy tetap didukung
+    [`mgr:upcloud:deleteall`, '^mgr:upcloud:deleteall$'],
+    [`mgr:upcloud:deleteall:confirm`, '^mgr:upcloud:deleteall:confirm$'], // BUG: dulu ketelan deleteall
+    [`mgr:acc:${acc}:delete`, '^mgr:acc:([a-f0-9]{6}):delete$'],
+    [`mgr:acc:${acc}:delete:confirm`, '^mgr:acc:([a-f0-9]{6}):delete:confirm$'], // BUG: dulu ketelan delete
+    [`mgr:acc:${acc}`, '^mgr:acc:([a-f0-9]{6})$'],
+    [`mgr:upcloud`, '^mgr:upcloud$'],
+    [`wiz:pw:random`, '^wiz:pw:(random|custom|default)$'],
+    [`reinstall:win:customiso`, '^reinstall:win:customiso$'],
+    [`reinstall:ostype:linux`, '^reinstall:ostype:(linux|windows)$'],
+    [`reinstall:ostype:windows`, '^reinstall:ostype:(linux|windows)$'],
+    [`reinstall:image:Windows 11 Pro`, '^reinstall:image:(.+)$'],
+    [`reinstall:linux:ubuntu:22.04`, '^reinstall:linux:(.+):(.+)$'],
+    [`guide:3`, '^guide:(\\d+)$']
+  ];
+  for (const [data, expectedPart] of cases) {
+    const matched = firstMatch(data);
+    assert(matched, `tidak ada handler untuk ${data}`);
+    assert(matched.includes(expectedPart), `${data} -> ${matched}, seharusnya mengandung ${expectedPart}`);
+  }
+});
+
+ok('callback_data: semua literal ≤64 byte setelah substitusi', () => {
+  const files = [path.join(__dirname, '..', 'index.js'), path.join(__dirname, '..', 'ui', 'manager.js')];
+  const uuid = '00aa11bb-22cc-33dd-44ee-55ff66778899';
+  const seen = new Set();
+  for (const f of files) {
+    const src = fs.readFileSync(f, 'utf8');
+    for (const m of src.matchAll(/callback_data:\s*'([^']+)'/g)) seen.add(m[1]);
+    for (const m of src.matchAll(/callback_data:\s*`([^`]+)`/g)) {
+      const t = m[1].replace(/\$\{[^}]*\}/g, (s) => {
+        const e = s.slice(2, -1);
+        if (/uuid/i.test(e)) return uuid;
+        if (/acc(Id|ountId)|acc\.id/i.test(e)) return 'a1b2c3';
+        if (/z\.id/.test(e)) return 'sg-sin1';
+        if (/p\.name/.test(e)) return '1xCPU-1GB';
+        if (/p\.label/.test(e)) return 'Windows 11 IoT Ent 24H2';
+        if (/index/.test(e)) return '9';
+        return 'X';
+      });
+      seen.add(t);
+    }
+  }
+  assert(seen.size > 30, `callback literal terlalu sedikit: ${seen.size}`);
+  for (const cb of seen) {
+    const len = Buffer.byteLength(cb, 'utf8');
+    assert(len <= 64, `callback_data >64 byte: "${cb}" (${len})`);
+  }
+});
+
+// --- Regresi: progress HTML escape + timer ---
+ok('progress: checklist meng-escape HTML (anti edit gagal 400)', () => {
+  const LiveProgress = require('../lib/progress');
+  const fakeBot = { telegram: { async editMessageText() {} } };
+  const prog = new LiveProgress(fakeBot, 1, 2, 'Judul <x>', 900);
+  prog.addStep('Perbaikan <b>config</b>', 'err & <detail>');
+  const txt = prog._render();
+  assert(txt.includes('&lt;b&gt;'), 'tag harus di-escape: ' + txt);
+  assert(txt.includes('&amp;'), '& harus di-escape');
+  assert(!txt.includes('<b>') && !txt.includes('<x>'), 'HTML mentah tidak boleh lolos');
+});
+
+okAsync('progress: start idempotent & setTickMs merestart interval', async () => {
+  const LiveProgress = require('../lib/progress');
+  const fakeBot = { telegram: { async editMessageText() {} } };
+  const prog = new LiveProgress(fakeBot, 1, 2, 'T', 50);
+  prog.addStep('a');
+  prog.start();
+  const t1 = prog.timer;
+  prog.start(); // no-op dengan tick sama
+  assert(prog.timer === t1, 'start kedua tidak boleh mengganti timer');
+  prog.setTickMs(500); // harus restart (sebelumnya no-op -> bug polling 900ms selama 40 menit)
+  assert(prog.timer && prog.timer !== t1, 'setTickMs harus restart timer');
+  assert(prog._timerTickMs === 500);
+  const t2 = prog.timer;
+  prog.start();
+  assert(prog.timer === t2, 'start dengan tick sama no-op');
+  prog.stop();
+  assert(prog.timer === null);
+});
+
+// --- Regresi: larangan pola lama yang terbukti salah ---
+ok('regresi: pola API lama yang salah tidak muncul lagi di kode', () => {
+  const prov = fs.readFileSync(path.join(__dirname, '..', 'providers', 'upcloud.js'), 'utf8');
+  const idx = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+  // endpoint palsu /vnc_details tidak boleh dipakai dalam pemanggilan request (komentar dokumentasi boleh)
+  const provCodeOnly = prov.split('\n').filter(l => !l.trim().startsWith('//') && !l.trim().startsWith('*')).join('\n');
+  assert(!provCodeOnly.includes('vnc_details'), 'endpoint palsu /vnc_details masih dipakai di kode non-komentar');
+  assert(!provCodeOnly.includes('firewall_public_default_incoming_action'), 'atribut server palsu firewall masih dipakai');
+  assert(!/srvact:[^'`]*:delete:confirm/.test(idx), 'callback 65-byte srvact ...:delete:confirm masih dipakai (ganti :delc)');
+  // Default Rule wajib ada di akhir chain saat kunci firewall
+  assert(idx.includes("action: 'drop', direction: 'in'"), 'aturan Default drop terakhir hilang dari flow kunci firewall');
+});
+
 // === Mock UpCloud API (HTTP lokal) ===
 async function testMockUpCloud() {
   const server = http.createServer((req, res) => {
@@ -527,6 +673,79 @@ async function testMockUpCloud() {
       const msg = client.translateError(e);
       assert(msg.includes('Ditolak') && msg.includes('IP'));
     }
+  });
+
+  // === Regresi provider: endpoint & payload yang benar (tangkap argumen _request) ===
+  const mockRequest = UpCloudClient.prototype._request;
+
+  await okAsync('upcloud: getVncDetails pakai GET /server/{uuid} (API 1.3 remote_access_*)', async () => {
+    const calls = [];
+    UpCloudClient.prototype._request = async function(method, path) {
+      calls.push({ method, path });
+      assert(!path.includes('vnc_details'), 'masih memanggil endpoint palsu /vnc_details (404 di API 1.3)');
+      return { server: { remote_access_enabled: 'yes', remote_access_host: 'console.upcloud.com', remote_access_port: '5900', remote_access_password: 'abcd1234', remote_access_type: 'vnc' } };
+    };
+    try {
+      const c = new UpCloudClient('ucat_x');
+      const vnc = await c.getVncDetails('u1');
+      assert(calls.length === 1 && calls[0].method === 'GET' && calls[0].path === '/1.3/server/u1', 'calls: ' + JSON.stringify(calls));
+      // alias legacy untuk UI tetap terisi
+      assert(vnc.vnc_host === 'console.upcloud.com' && vnc.vnc_port === '5900' && vnc.vnc_password === 'abcd1234');
+      assert(vnc.remote_access_enabled === 'yes');
+    } finally {
+      UpCloudClient.prototype._request = mockRequest;
+    }
+  });
+
+  await okAsync('upcloud: setFirewallStatus hanya mengirim atribut firewall on/off', async () => {
+    const bodies = [];
+    UpCloudClient.prototype._request = async function(method, path, body) {
+      bodies.push({ method, path, body });
+      return { server: {} };
+    };
+    try {
+      const c = new UpCloudClient('ucat_x');
+      await c.setFirewallStatus('u1', true);
+      await c.setFirewallStatus('u1', false);
+      assert(bodies.length === 2 && bodies[0].method === 'PUT');
+      assert(bodies[0].path === '/1.3/server/u1');
+      assert.deepStrictEqual(bodies[0].body, { server: { firewall: 'on' } }, 'payload on: ' + JSON.stringify(bodies[0].body));
+      assert.deepStrictEqual(bodies[1].body, { server: { firewall: 'off' } }, 'payload off');
+    } finally {
+      UpCloudClient.prototype._request = mockRequest;
+    }
+  });
+
+  await okAsync('upcloud: billing summary coba endpoint baru lalu fallback deprecated saat 404', async () => {
+    const paths = [];
+    UpCloudClient.prototype._request = async function(method, path) {
+      paths.push(path);
+      if (path.includes('/billing/summary/')) {
+        const e = new Error('not found'); e.status = 404; throw e;
+      }
+      if (path.includes('/billing_summary/')) return { billing: { total_amount: '12.34', currency: 'EUR' } };
+      throw new Error('unexpected path ' + path);
+    };
+    try {
+      const c = new UpCloudClient('ucat_x');
+      const res = await c.getBillingSummary('2026-09');
+      assert(paths.length === 2, 'harus coba 2 endpoint: ' + paths.join(','));
+      assert(paths[0] === '/1.3/account/billing/summary/2026-09', 'endpoint baru dulu: ' + paths[0]);
+      assert(paths[1] === '/1.3/account/billing_summary/2026-09', 'fallback deprecated: ' + paths[1]);
+      assert(res.billing.total_amount === '12.34');
+    } finally {
+      UpCloudClient.prototype._request = mockRequest;
+    }
+  });
+
+  ok('upcloud: parseBillingTotal & parseBillingCurrency defensif', () => {
+    assert(UpCloudClient.parseBillingTotal({ billing: { total_amount: '12.34' } }) === '12.34');
+    assert(UpCloudClient.parseBillingTotal({ billing_summary: { total: 9.5 } }) === '9.5');
+    assert(UpCloudClient.parseBillingTotal({ total: 7 }) === '7');
+    assert(UpCloudClient.parseBillingTotal({ lines: [{ amount: '2.00' }, { amount: '3.50' }] }) === '5.50');
+    assert(UpCloudClient.parseBillingTotal({}) === null);
+    assert(UpCloudClient.parseBillingCurrency({ billing_summary: { currency: 'EUR' } }) === 'EUR');
+    assert(UpCloudClient.parseBillingCurrency({}) === '');
   });
 
   UpCloudClient.prototype._request = originalRequest;

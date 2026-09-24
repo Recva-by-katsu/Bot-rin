@@ -72,6 +72,38 @@ class UpCloudClient {
     }
   }
 
+  // Parsing defensif total tagihan bulanan — endpoint baru & deprecated beda bentuk respons.
+  static parseBillingTotal(json) {
+    if (!json) return null;
+    const cands = [
+      json.billing?.total_amount,
+      json.billing?.total,
+      json.billing_summary?.total_amount,
+      json.billing_summary?.total,
+      json.summary?.total,
+      json.total_amount,
+      json.total
+    ];
+    for (const c of cands) {
+      if (c !== undefined && c !== null && c !== '') return String(c);
+    }
+    // Coba jumlahkan baris rincian kalau ada
+    const lines = json.billing?.billing_summary_line || json.billing_summary?.lines || json.lines || json.billing?.lines;
+    if (Array.isArray(lines) && lines.length) {
+      let sum = 0, found = false;
+      for (const ln of lines) {
+        const v = parseFloat(ln.total_amount ?? ln.amount ?? ln.price ?? ln.total);
+        if (!isNaN(v)) { sum += v; found = true; }
+      }
+      if (found) return sum.toFixed(2);
+    }
+    return null;
+  }
+  static parseBillingCurrency(json) {
+    if (!json) return '';
+    return json.billing?.currency || json.billing_summary?.currency || json.currency || '';
+  }
+
   translateError(err) {
     if (!err.status) return `⚠️ Gagal terhubung ke UpCloud: ${err.message}. Coba lagi nanti.`;
     if (err.status === 401) return `❌ Token salah / dicabut / kedaluwarsa (401). Buat token baru di panel UpCloud.`;
@@ -104,7 +136,17 @@ class UpCloudClient {
   }
   async getBillingSummary(yearMonth) {
     // yearMonth: YYYY-MM
-    return this._request('GET', `/1.3/account/billing_summary/${yearMonth}`);
+    // Endpoint terbaru dulu; fallback ke deprecated kalau 404.
+    try {
+      const data = await this._request('GET', `/1.3/account/billing/summary/${yearMonth}`);
+      data.__endpoint = 'billing/summary';
+      return data;
+    } catch (e) {
+      if (e.status !== 404) throw e;
+      const legacy = await this._request('GET', `/1.3/account/billing_summary/${yearMonth}`);
+      legacy.__endpoint = 'billing_summary';
+      return legacy;
+    }
   }
 
   // Zone
@@ -202,8 +244,22 @@ class UpCloudClient {
     return this._request('DELETE', `/1.3/server/${uuid}?storages=1&backups=delete`);
   }
   async getVncDetails(uuid) {
-    const data = await this._request('GET', `/1.3/server/${uuid}/vnc_details`);
-    return data?.server;
+    // API 1.3 tidak punya /vnc_details; field VNC diganti remote_access_* di detail server.
+    // Ambil dari GET /1.3/server/{uuid} lalu sediakan alias vnc_* agar UI lama tetap jalan.
+    const srv = await this.getServer(uuid);
+    if (!srv) return null;
+    const out = {
+      remote_access_enabled: srv.remote_access_enabled,
+      remote_access_type: srv.remote_access_type || 'vnc',
+      remote_access_host: srv.remote_access_host,
+      remote_access_port: srv.remote_access_port,
+      remote_access_password: srv.remote_access_password,
+      // alias legacy
+      vnc_host: srv.remote_access_host,
+      vnc_port: srv.remote_access_port,
+      vnc_password: srv.remote_access_password
+    };
+    return out;
   }
   async getFirewallRules(uuid) {
     const data = await this._request('GET', `/1.3/server/${uuid}/firewall_rule`);
@@ -212,12 +268,12 @@ class UpCloudClient {
   async setFirewallRules(uuid, rules) {
     return this._request('PUT', `/1.3/server/${uuid}/firewall_rule`, { firewall_rules: { firewall_rule: rules } });
   }
-  async setFirewallStatus(uuid, on, defaultAction='drop') {
-    if (on) {
-      return this._request('PUT', `/1.3/server/${uuid}`, { server: { firewall: "on", firewall_public_default_incoming_action: defaultAction } });
-    } else {
-      return this._request('PUT', `/1.3/server/${uuid}`, { server: { firewall: "off" } });
-    }
+  async setFirewallStatus(uuid, on) {
+    // API 1.3: atribut server hanya `firewall` (on/off). Tidak ada atribut
+    // firewall_public_default_incoming_action — "Default Rule" dikelola sebagai
+    // ATURAN TERAKHIR pada chain (direction + action saja), lihat setFirewallRules.
+    // Catatan: akun trial bisa menolak firewall=off (TRIAL_FIREWALL 403).
+    return this._request('PUT', `/1.3/server/${uuid}`, { server: { firewall: on ? "on" : "off" } });
   }
   async setRemoteAccess(uuid, enabled) {
     return this._request('PUT', `/1.3/server/${uuid}`, { server: { remote_access_enabled: enabled ? "yes" : "no" } });
