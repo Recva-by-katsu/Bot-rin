@@ -27,15 +27,18 @@ Bot Telegram ramah pemula untuk mengelola VPS UpCloud. Multi-user & multi-akun: 
 - 🔐 **Aktifkan Password** (Show SSH Key, Setup VPS, Check VPS)
   - **Show Key Bot:** tampilkan public key ED25519 bot.
   - **Setup VPS** (Ubuntu/Debian): input sumber key (key bot / key sendiri), IP/host, username (`root/ubuntu/debian` regex `^[a-z_][a-z0-9_-]*$`), 9 langkah:
-    1. backup `/etc/ssh/sshd_config` → `/etc/ssh/sshd_config.bak.<ts>`
-    2. fix `PasswordAuthentication yes` di `sshd_config` + drop-in `/etc/ssh/sshd_config.d/60-bot-allow-password.conf`
-    3. `sshd -t` validasi config
-    4. restart `ssh`/`sshd` (systemctl/service)
-    5. `sshd -T | grep passwordauthentication`
-    6. `chpasswd` via `echo user:pass | base64` (tanpa spasi/kutip/backslash di password)
-    7. tes login ulang dengan password baru
-    8. rollback jika gagal (restore backup)
-    9. hapus key bot dari `authorized_keys` setelah sukses.
+    1. Koneksi SSH
+    2. Deteksi OS (`/etc/os-release`, hanya `ubuntu`/`debian` yang diterima)
+    3. Backup konfigurasi SSH → `/tmp/sshd_backup_<ts>/` (config utama + semua `sshd_config.d/*.conf`)
+    4. Perbaikan konfigurasi `PasswordAuthentication yes`: tulis drop-in bot `/etc/ssh/sshd_config.d/00-bot-allow-password.conf` (awalan `00-` supaya menang di load order atas drop-in bawaan image seperti `50-cloud-init.conf`/`60-cloudimg-settings.conf`), normalkan config utama, dan betulkan drop-in lain yang masih `no`. sshd memakai nilai yang dibaca **pertama**, jadi semua tempat harus konsisten. Baris di dalam blok `Match` sengaja tidak disentuh. Kalau login sebagai root, `PermitRootLogin yes` ikut dipastikan.
+    5. Validasi `sshd -t`
+    6. Restart layanan SSH (`systemctl`/`service`, `ssh` lalu `sshd`)
+    7. Verifikasi konfigurasi efektif (`sshd -T` harus melaporkan `passwordauthentication yes`)
+    8. Set password login (`chpasswd` via `echo <base64> | base64 -d`, jadi password tidak pernah muncul plaintext di command line)
+    9. Tes ulang koneksi SSH
+    - Gagal di langkah 5–7 → **rollback otomatis** dari backup (drop-in bot ikut dibuang) lalu restart ulang SSH.
+    - Script perbaikan idempotent: dijalankan berulang hasilnya sama, `sshd_config` tidak makin panjang.
+    - Key bot dihapus dari `authorized_keys` hanya pada alur **Buat VPS (password otomatis)** dan **Reinstall Resmi** setelah password terbukti bisa dipakai login; pada Setup VPS manual key sumber dibiarkan.
   - Check VPS: cek `PasswordAuthentication`.
 
 - 💿 **Install/Reinstall OS (reinstall.sh)**

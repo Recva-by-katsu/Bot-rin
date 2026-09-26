@@ -27,7 +27,7 @@ const Stats = require('./lib/stats');
 const JobManager = require('./lib/jobs');
 const LiveProgress = require('./lib/progress');
 const SshSession = require('./lib/sshClient');
-const { setupVpsFlow } = require('./lib/setupFlow');
+const { setupVpsFlow, SETUP_STEPS } = require('./lib/setupFlow');
 const reinstallFlow = require('./lib/reinstallFlow');
 const { getPage } = require('./lib/guide');
 const UpCloudClient = require('./providers/upcloud');
@@ -1332,7 +1332,7 @@ Ketik /cancel untuk batal.`);
         stats.inc('vpsDeleted');
       } catch (e) {
         const c = new UpCloudClient('');
-        prog.setFail(2, e.message.slice(0,42));
+        prog.failRunning(e.message.slice(0,42));
         await prog.finish(`❌ Gagal hapus VPS ${uuid}: ${c.translateError(e)}`);
         stats.inc('vpsDeleteFail');
       }
@@ -1613,15 +1613,9 @@ Ketik /cancel untuk batal.`);
     const chatId = ctx.chat.id;
     const msg = await ctx.telegram.sendMessage(chatId, `🔐 Setup VPS ${sess.data.ip}...`);
     const prog = new LiveProgress({ telegram: ctx.telegram }, chatId, msg.message_id, '🔐 Setup VPS', 900);
-    prog.addStep('Koneksi SSH');
-    prog.addStep('Deteksi OS');
-    prog.addStep('Backup konfigurasi SSH');
-    prog.addStep('Perbaikan konfigurasi');
-    prog.addStep('Validasi sshd -t');
-    prog.addStep('Restart layanan SSH');
-    prog.addStep('Verifikasi konfigurasi efektif');
-    prog.addStep('Set password login');
-    prog.addStep('Tes ulang koneksi SSH');
+    // Pakai SETUP_STEPS dari setupFlow supaya nama langkah tidak bisa melenceng
+    // dari yang dipakai di dalam alur (dulu ditulis manual & sudah mulai beda).
+    SETUP_STEPS.forEach(s => prog.addStep(s));
     prog.start();
 
     const sessData = { ...sess.data }; // copy
@@ -1639,7 +1633,7 @@ Ketik /cancel untuk batal.`);
           privateKeyPath: sessData.privateKeyPath || null
         });
         await ssh.connect();
-        const result = await require('./lib/setupFlow').setupVpsFlow({ sshSession: ssh, targetUsername: sessData.username, password: sessData.password, isRootUser, progress: prog });
+        const result = await setupVpsFlow({ sshSession: ssh, targetUsername: sessData.username, password: sessData.password, isRootUser, progress: prog, stepOffset: 0 });
         if (result.success) {
           quota.use(ctx.from.id, 'setup');
           stats.inc('deploySuccess');
@@ -2223,7 +2217,7 @@ Cara login: aplikasi Remote Desktop ke ${sessData.ip}:3389
         }
       } catch (e) {
         stats.inc('reinstallFailed');
-        prog.setFail(5, e.message.slice(0,42));
+        prog.failRunning(e.message.slice(0,42));
         await prog.finish(`❌ <b>Reinstall Gagal</b>
 
 Error: ${validators.redactSecrets(e.message)}
@@ -2419,12 +2413,18 @@ Jika VPS macet, gunakan 🖥 Console (VNC) di menu Kelola VPS untuk pulihkan.
         const portOpen = await waitForPort(serverIp, 22, 3*60*1000);
         if (!portOpen) throw new Error('Timeout tunggu port 22 setelah rebuild');
 
+        // Index langkah "Cek disk sisa" bergeser kalau sub-langkah setup disisipkan
+        let diskStepIdx = 7;
         if (sessData.loginMode === 'password') {
           const sshOk = await waitForSsh(serverIp, 22, 'root', botKeyPair.privPath, null, 2*60*1000);
           if (!sshOk) throw new Error('Gagal SSH dengan key bot setelah rebuild');
           const ssh = new SshSession({ host: serverIp, username: 'root', privateKeyPath: botKeyPair.privPath });
           await ssh.connect();
-          const setupRes = await setupVpsFlow({ sshSession: ssh, targetUsername: 'root', password: sessData.password, isRootUser: true, progress: prog });
+          // Sisipkan 9 sub-langkah setup di bawah langkah "Tunggu SSH & setup password"
+          // supaya checklist induk tidak tertimpa (dulu setup menulis ke index 0..8).
+          const setupOff = prog.insertStepsAt(7, SETUP_STEPS);
+          diskStepIdx = setupOff + SETUP_STEPS.length;
+          const setupRes = await setupVpsFlow({ sshSession: ssh, targetUsername: 'root', password: sessData.password, isRootUser: true, progress: prog, stepOffset: setupOff });
           if (!setupRes.success) {
             ssh.close();
             throw new Error(`Setup password gagal setelah rebuild: ${setupRes.error}. Key bot masih ada.`);
@@ -2442,7 +2442,7 @@ Jika VPS macet, gunakan 🖥 Console (VNC) di menu Kelola VPS untuk pulihkan.
           prog.setDone(6, 'skip (key mode)');
         }
 
-        prog.setRunning(7);
+        prog.setRunning(diskStepIdx);
         const finalSrv = await client.getServer(sessData.serverUuid);
         const finalDevices = finalSrv.storage_devices ? (Array.isArray(finalSrv.storage_devices.storage_device) ? finalSrv.storage_devices.storage_device : [finalSrv.storage_devices.storage_device]) : [];
         const diskCount = finalDevices.filter(d=>d.type==='disk').length;
@@ -2462,7 +2462,7 @@ ${extraNote}
         stats.inc('deploySuccess');
       } catch (e) {
         const c = new UpCloudClient('');
-        prog.setFail(7, e.message.slice(0,42));
+        prog.failRunning(e.message.slice(0,42));
         await prog.finish(`❌ <b>Reinstall Resmi Gagal</b>
 
 Error: ${c.translateError(e) || validators.redactSecrets(e.message)}
@@ -2601,16 +2601,21 @@ VPS mungkin masih ada dan ditagih. Cek di Kelola VPS.
           if (!sshOk) throw new Error('Gagal SSH dengan key bot');
           const ssh = new SshSession({ host: ip, username: 'root', privateKeyPath: botKeyPair.privPath });
           await ssh.connect();
+          // Sisipkan 9 sub-langkah setup tepat di bawah "Setup password" dan beri
+          // tahu setupFlow offset-nya. Tanpa ini, setupFlow menulis ke index 0..8
+          // dan menimpa checklist "Buat server / Tunggu started / Tunggu port 22".
+          const setupOff = prog.insertStepsAt(4, SETUP_STEPS);
+          const iTestLogin = setupOff + SETUP_STEPS.length;   // dulu index 4
+          const iRemoveKey = iTestLogin + 1;                  // dulu index 5
           // Setup flow
-          const setupRes = await setupVpsFlow({ sshSession: ssh, targetUsername: 'root', password: sessData.password, isRootUser: true, progress: prog });
-          // prog steps for setup are inside setupFlow, but we have our own steps. We'll map
+          const setupRes = await setupVpsFlow({ sshSession: ssh, targetUsername: 'root', password: sessData.password, isRootUser: true, progress: prog, stepOffset: setupOff });
           if (!setupRes.success) {
             ssh.close();
             throw new Error(`Setup password gagal: ${setupRes.error}. VPS sudah ada dan ditagih! IP: ${ip}. Key bot masih ada, kamu bisa coba setup manual lewat menu 🔐 Aktifkan Password.`);
           }
           prog.setDone(3, 'password ok');
 
-          prog.setRunning(4, 'tes login password');
+          prog.setRunning(iTestLogin, 'tes login password');
           // Tes login dengan password
           const sshPw = new SshSession({ host: ip, username: 'root', password: sessData.password });
           try {
@@ -2618,17 +2623,17 @@ VPS mungkin masih ada dan ditagih. Cek di Kelola VPS.
             const res = await sshPw.exec('whoami');
             sshPw.close();
             if (!res.stdout.includes('root')) throw new Error('whoami bukan root');
-            prog.setDone(4, 'login ok');
+            prog.setDone(iTestLogin, 'login ok');
           } catch (e) {
             ssh.close();
             throw new Error(`Tes login password gagal: ${e.message}. VPS sudah ada dan ditagih! IP: ${ip}. Key bot masih ada, jangan hapus! Coba setup ulang.`);
           }
 
-          prog.setRunning(5, 'hapus key bot');
+          prog.setRunning(iRemoveKey, 'hapus key bot');
           // Hapus public key bot dari authorized_keys
-          const delRes = await ssh.exec(buildRemoveBotKeyCmd('/root/.ssh/authorized_keys'));
+          await ssh.exec(buildRemoveBotKeyCmd('/root/.ssh/authorized_keys'));
           ssh.close();
-          prog.setDone(5, 'key bot dihapus');
+          prog.setDone(iRemoveKey, 'key bot dihapus');
 
           await prog.finish(`✅ <b>VPS Berhasil Dibuat!</b>
 
@@ -2675,7 +2680,7 @@ Cara login: <code>ssh root@${ip}</code> (pakai private key yang sesuai dengan pu
         if (createdServerUuid) {
           extra = `\n\n⚠️ <b>VPS sudah terbuat dan ditagih!</b>\nUUID: ${createdServerUuid}\nIP: ${createdServerIp || 'belum dapat'}\n\nLangkah lanjutan:\n• Cek di 🖥 Kelola VPS\n• Jika gagal setup password, coba menu 🔑 Aktifkan Password dengan IP ${createdServerIp}\n• Hapus VPS kalau tidak jadi pakai (biar tidak ditagih)`;
         }
-        prog.setFail(0, e.message.slice(0,42));
+        prog.failRunning(e.message.slice(0,42));
         await prog.finish(`❌ <b>Gagal Buat VPS</b>
 
 Error: ${c.translateError(e) || validators.redactSecrets(e.message)}${extra}

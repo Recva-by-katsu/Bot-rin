@@ -5,13 +5,16 @@
  */
 
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
 const assert = require('assert');
+const { execFileSync } = require('child_process');
 
 // Import lib yang akan diuji
 const validators = require('../lib/validators');
+const sshdConfig = require('../lib/sshdConfig');
 const passwordLib = require('../lib/password');
 const Vault = require('../lib/vault');
 const QuotaManager = require('../lib/quota');
@@ -31,16 +34,24 @@ function ok(name, fn) {
     failed++;
   }
 }
-async function okAsync(name, fn) {
-  try {
-    await fn();
-    console.log(`✅ ${name}`);
-    passed++;
-  } catch (e) {
-    console.error(`❌ ${name}: ${e.message}`);
-    console.error(e.stack);
-    failed++;
-  }
+// Test async dipanggil tanpa await di badan file, jadi promise-nya dicatat dan
+// ditunggu sebelum ringkasan dicetak. Tanpa ini, kegagalan test async bisa
+// terjadi SETELAH "HASIL TEST" terpampang dan suite tetap lapor 0 gagal.
+const pendingAsync = [];
+function okAsync(name, fn) {
+  const p = (async () => {
+    try {
+      await fn();
+      console.log(`✅ ${name}`);
+      passed++;
+    } catch (e) {
+      console.error(`❌ ${name}: ${e.message}`);
+      console.error(e.stack);
+      failed++;
+    }
+  })();
+  pendingAsync.push(p);
+  return p;
 }
 
 // === Test validators ===
@@ -599,6 +610,658 @@ ok('regresi: pola API lama yang salah tidak muncul lagi di kode', () => {
   assert(idx.includes("action: 'drop', direction: 'in'"), 'aturan Default drop terakhir hilang dari flow kunci firewall');
 });
 
+// === Regresi: script sshd (bug "key is not defined" yang bikin VPS terlanjur ditagih) ===
+
+function haveBin(name) {
+  try {
+    execFileSync('sh', ['-c', `command -v ${name} >/dev/null 2>&1`], { stdio: 'ignore' });
+    return true;
+  } catch { return false; }
+}
+function shRun(script, opts = {}) {
+  // Jalankan script lewat `sh` (bukan bash) karena di VPS dijalankan via ssh exec
+  return execFileSync('sh', ['-c', script], { encoding: 'utf8', timeout: 30000, ...opts });
+}
+
+/**
+ * Bikin fixture sshd_config khas image Ubuntu/Debian cloud di dir sementara.
+ * `mode`:
+ *  - ubuntu        : Include di atas + drop-in "PasswordAuthentication no" + Match block
+ *  - debian-simple : tanpa Include, tanpa dir drop-in, semua masih dikomentar
+ *  - match-first   : Include, lalu blok Match lebih dulu daripada keyword global
+ *  - already-ok    : sudah benar sejak awal (uji idempotent)
+ */
+function makeSshdFixture(mode) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `sshd-${mode}-`));
+  const cfgDir = path.join(dir, 'etc', 'ssh');
+  const dropinDir = path.join(cfgDir, 'sshd_config.d');
+  fs.mkdirSync(dropinDir, { recursive: true });
+  const main = path.join(cfgDir, 'sshd_config');
+  if (mode === 'ubuntu') {
+    fs.writeFileSync(main, [
+      '#\t$OpenBSD: sshd_config,v 1.104 2021/07/02 05:11:21 dtucker Exp $',
+      `Include ${dropinDir}/*.conf`,
+      '',
+      'Port 22',
+      'PermitRootLogin prohibit-password',
+      'PubkeyAuthentication yes',
+      '',
+      '# To disable tunneled clear text passwords, change to no here!',
+      '#PasswordAuthentication yes',
+      'PasswordAuthentication no',
+      'PasswordAuthentication no',
+      'KbdInteractiveAuthentication no',
+      '',
+      'UsePAM yes',
+      'Subsystem\tsftp\t/usr/lib/openssh/sftp-server',
+      '',
+      'Match User sftponly',
+      '  PasswordAuthentication no',
+      '  ForceCommand internal-sftp',
+      ''
+    ].join('\n'));
+    fs.writeFileSync(path.join(dropinDir, '60-cloudimg-settings.conf'), 'PasswordAuthentication no\n');
+    fs.writeFileSync(path.join(dropinDir, '50-no-root.conf'), '#PermitRootLogin no\n#PasswordAuthentication yes\n');
+  } else if (mode === 'debian-simple') {
+    fs.writeFileSync(main, 'Port 22\n#PasswordAuthentication yes\nPermitRootLogin prohibit-password\nUsePAM yes\n');
+    fs.rmSync(dropinDir, { recursive: true, force: true });
+  } else if (mode === 'match-first') {
+    // `PermitRootLogin no` di SINI masih scope global (sebelum Match), sedangkan
+    // semua baris setelah `Match User deploy` adalah scope match dan tidak boleh
+    // disentuh bot. PasswordAuthentication belum ada di scope global sama sekali.
+    fs.writeFileSync(main, [
+      `Include ${dropinDir}/*.conf`,
+      'PermitRootLogin no',
+      'UsePAM yes',
+      'Match User deploy',
+      '  X11Forwarding no',
+      '  PasswordAuthentication no',
+      '  ForceCommand internal-sftp',
+      ''
+    ].join('\n'));
+    fs.writeFileSync(path.join(dropinDir, '10-off.conf'), 'PasswordAuthentication no\n');
+  } else if (mode === 'already-ok') {
+    fs.writeFileSync(main, [
+      `Include ${dropinDir}/*.conf`,
+      'PasswordAuthentication yes',
+      'PermitRootLogin yes',
+      'UsePAM yes',
+      ''
+    ].join('\n'));
+    fs.writeFileSync(path.join(dropinDir, '10-on.conf'), 'PasswordAuthentication yes\n');
+  }
+  return { dir, cfgDir, dropinDir, main };
+}
+
+function fixtureOpts(fx) {
+  let hostKeyArgs = '';
+  if (haveBin('ssh-keygen')) {
+    const hk = path.join(fx.dir, 'hostkey');
+    try {
+      execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', hk], { stdio: 'ignore', input: '' });
+      hostKeyArgs = hk;
+    } catch { hostKeyArgs = ''; }
+  }
+  const opts = {
+    configDir: fx.cfgDir,
+    dropinDir: fx.dropinDir
+  };
+  if (hostKeyArgs) opts.hostKey = hostKeyArgs;
+  return opts;
+}
+
+/** Jalankan script fix lalu kembalikan {rc, stdout, stderr}. */
+function runFixScript(isRoot, opts) {
+  const script = sshdConfig.getFixCommands(isRoot, opts);
+  const before = script; // pastikan generator tidak melempar (dulu: ReferenceError)
+  assert(typeof before === 'string' && before.length > 50, 'script kosong');
+  const res = require('child_process').spawnSync('sh', ['-c', script], { encoding: 'utf8', timeout: 30000 });
+  return { rc: res.status, stdout: res.stdout || '', stderr: res.stderr || '', script };
+}
+
+ok('regresi: generator script sshd tidak melempar ReferenceError (bug "key is not defined")', () => {
+  // Bug asli: template literal JS berisi `${key}`/`${value}` milik shell ->
+  // ReferenceError: key is not defined, dan VPS sudah terlanjur dibuat & ditagih.
+  for (const isRoot of [true, false]) {
+    const script = sshdConfig.getFixCommands(isRoot);
+    assert(script.includes('PasswordAuthentication'), 'script root=' + isRoot + ' kehilangan keyword');
+    // Hasil interpolasi JS yang gagal akan muncul sebagai undefined/[object Object].
+    // Catatan: `${eg_last}` di dalam script adalah syntax SHELL yang sah (dipakai
+    // sed), jadi yang dilarang hanya jejak interpolasi JS yang tidak terisi.
+    assert(!/undefined|\[object Object\]|NaN/.test(script), 'ada jejak interpolasi JS gagal di script:\n' + script);
+    // Variabel shell milik script harus tetap utuh
+    assert(script.includes('${eg_last}'), 'variabel shell ${eg_last} hilang dari script');
+    // sudo hanya untuk non-root
+    assert(isRoot ? !script.includes('sudo') : script.includes('sudo -n'), 'prefix sudo salah untuk root=' + isRoot);
+  }
+  // Semua generator lain juga harus bisa dipanggil tanpa opts
+  assert(typeof sshdConfig.getValidateCommand(true) === 'string');
+  assert(typeof sshdConfig.getRestartCommands(false) === 'string');
+  assert(typeof sshdConfig.getCheckEffectiveCommand(true) === 'string');
+  assert(Array.isArray(sshdConfig.getBackupCommands('/tmp/b', true)));
+  assert(typeof sshdConfig.getRollbackCommands('/tmp/b', true) === 'string');
+  assert(typeof sshdConfig.awkFixProgram() === 'string');
+  assert(typeof sshdConfig.awkHasGlobalProgram() === 'string');
+});
+
+ok('regresi: script sshd lolos cek syntax sh (POSIX, bukan bash-only)', () => {
+  if (!haveBin('sh')) return;
+  for (const isRoot of [true, false]) {
+    const script = sshdConfig.getFixCommands(isRoot);
+    const tmp = path.join(os.tmpdir(), `sshd-syntax-${isRoot ? 'root' : 'user'}.sh`);
+    fs.writeFileSync(tmp, script);
+    const res = require('child_process').spawnSync('sh', ['-n', tmp], { encoding: 'utf8' });
+    fs.rmSync(tmp, { force: true });
+    assert.strictEqual(res.status, 0, `sh -n gagal (root=${isRoot}): ${res.stderr}`);
+  }
+});
+
+ok('regresi: program awk tidak bergantung exit code 2 (mawk pakai 2 untuk error fatal)', () => {
+  const prog = sshdConfig.awkFixProgram();
+  const progHas = sshdConfig.awkHasGlobalProgram();
+  // Tidak boleh ada `exit 2` / `exit (done ? 2 : 0)` di program awk
+  assert(!/exit\s*\(\s*done/.test(prog), 'awkFixProgram masih memakai exit code berbasis done');
+  assert(!/exit 2/.test(prog), 'awkFixProgram memakai exit 2 (bentrok dengan error fatal mawk)');
+  // hasglobal pakai code 3 yang bebas bentrok, dan statusnya harus lewat variabel:
+  // `exit` di dalam rule tetap menjalankan blok END, jadi `exit 3` langsung di rule
+  // akan ditimpa oleh END.
+  assert(/exit\s*\(\s*found\s*\?\s*3\s*:\s*0\s*\)/.test(progHas),
+    'awkHasGlobalProgram harus menutup dengan exit (found ? 3 : 0):\n' + progHas);
+  assert(!/\)\s*exit 3/.test(progHas), 'jangan exit 3 langsung di dalam rule (akan ditimpa blok END)');
+  // Tidak boleh ada baris penanda ber-# (mawk salah lex literal "#" dalam konkatenasi)
+  assert(!prog.includes('#BOT#'), 'penanda #BOT# masih dipakai di awk');
+  assert(!progHas.includes('#BOT#'), 'penanda #BOT# masih dipakai di awk hasglobal');
+});
+
+ok('regresi: awkHasGlobalProgram benar-benar mengembalikan 3 saat keyword ada (bukan selalu 0)', () => {
+  // Inilah bug yang bikin fix tidak idempotent: exit 3 di rule ditimpa END { exit 0 }.
+  if (!haveBin('awk')) return;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'awk-has-'));
+  const progFile = path.join(dir, 'has.awk');
+  fs.writeFileSync(progFile, sshdConfig.awkHasGlobalProgram());
+  const run = (content, key) => {
+    const f = path.join(dir, 'c.conf');
+    fs.writeFileSync(f, content);
+    const r = require('child_process').spawnSync('awk', ['-v', `KEY=${key}`, '-f', progFile, f], { encoding: 'utf8' });
+    return r.status;
+  };
+  assert.strictEqual(run('PasswordAuthentication no\nUsePAM yes\n', 'PasswordAuthentication'), 3, 'keyword ada -> harus 3');
+  assert.strictEqual(run('PasswordAuthentication yes\n', 'PasswordAuthentication'), 3, 'keyword ada (yes) -> harus 3');
+  assert.strictEqual(run('  PasswordAuthentication no\n', 'PasswordAuthentication'), 3, 'keyword dengan indentasi -> harus 3');
+  assert.strictEqual(run('#PasswordAuthentication yes\nUsePAM yes\n', 'PasswordAuthentication'), 0, 'masih dikomentar -> harus 0');
+  assert.strictEqual(run('UsePAM yes\n', 'PasswordAuthentication'), 0, 'tidak ada -> harus 0');
+  assert.strictEqual(run('Match User x\n  PasswordAuthentication no\n', 'PasswordAuthentication'), 0,
+    'di dalam blok Match bukan scope global -> harus 0');
+  // Keyword mirip tidak boleh ketuker (PasswordAuthentication vs KbdInteractiveAuthentication)
+  assert.strictEqual(run('KbdInteractiveAuthentication no\n', 'PasswordAuthentication'), 0, 'keyword mirip tidak boleh cocok');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+const SSHD_AVAILABLE = haveBin('sshd') || fs.existsSync('/usr/sbin/sshd');
+const SSHD_BIN = haveBin('sshd') ? 'sshd' : '/usr/sbin/sshd';
+
+function sshdRun(args) {
+  const res = require('child_process').spawnSync(SSHD_BIN, args, { encoding: 'utf8', timeout: 20000 });
+  return { rc: res.status, out: (res.stdout || '') + (res.stderr || '') };
+}
+
+/** Jalankan fix 2x, pastikan hasil identik (idempotent). */
+function assertIdempotent(mode) {
+  const fx = makeSshdFixture(mode);
+  const opts = fixtureOpts(fx);
+  const r1 = runFixScript(true, opts);
+  assert.strictEqual(r1.rc, 0, `[${mode}] run1 rc=${r1.rc} stderr=${r1.stderr}`);
+  const mainAfter1 = fs.readFileSync(fx.main, 'utf8');
+  const dropinsAfter1 = fs.existsSync(fx.dropinDir)
+    ? fs.readdirSync(fx.dropinDir).sort().map(f => f + ':' + fs.readFileSync(path.join(fx.dropinDir, f), 'utf8')).join('|')
+    : '';
+  const r2 = runFixScript(true, opts);
+  assert.strictEqual(r2.rc, 0, `[${mode}] run2 rc=${r2.rc} stderr=${r2.stderr}`);
+  const mainAfter2 = fs.readFileSync(fx.main, 'utf8');
+  const dropinsAfter2 = fs.existsSync(fx.dropinDir)
+    ? fs.readdirSync(fx.dropinDir).sort().map(f => f + ':' + fs.readFileSync(path.join(fx.dropinDir, f), 'utf8')).join('|')
+    : '';
+  assert.strictEqual(mainAfter2, mainAfter1, `[${mode}] config utama berubah saat dijalankan ulang:\n${mainAfter1}\n---\n${mainAfter2}`);
+  assert.strictEqual(dropinsAfter2, dropinsAfter1, `[${mode}] drop-in berubah saat dijalankan ulang`);
+  return { fx, opts };
+}
+
+/** Pastikan nilai efektif sshd adalah passwordauthentication yes (+ permitrootlogin yes utk root). */
+function assertEffectiveYes(fx, opts, label) {
+  if (!SSHD_AVAILABLE || !opts.hostKey) return; // tidak bisa uji efektif tanpa sshd/hostkey
+  // sshd sering tidak ada di PATH (ada di /usr/sbin), jadi pakai path absolut
+  const withBin = (cmd) => cmd.replace(/(^|\s)sshd(\s)/, `$1${SSHD_BIN}$2`);
+  const eff = shRun(withBin(sshdConfig.getCheckEffectiveCommand(true, opts)));
+  const low = eff.toLowerCase();
+  assert(low.includes('passwordauthentication yes'), `[${label}] efektif masih bukan 'passwordauthentication yes':\n${eff.slice(0, 500)}`);
+  assert(low.includes('permitrootlogin yes'), `[${label}] efektif masih bukan 'permitrootlogin yes':\n${eff.slice(0, 500)}`);
+  // validasi config juga harus lolos
+  const val = require('child_process').spawnSync('sh', ['-c', withBin(sshdConfig.getValidateCommand(true, opts))], { encoding: 'utf8' });
+  assert.strictEqual(val.status, 0, `[${label}] sshd -t gagal: ${(val.stderr || '').slice(0, 300)}`);
+}
+
+ok('sshd fix: image Ubuntu cloud (drop-in "no", duplikat, blok Match) -> password auth yes', () => {
+  if (!haveBin('sh')) return;
+  const { fx, opts } = assertIdempotent('ubuntu');
+  const main = fs.readFileSync(fx.main, 'utf8');
+  // tidak boleh ada penanda/jejak internal yang lolos ke config
+  assert(!main.includes('#BOT#'), 'penanda internal bocor ke sshd_config:\n' + main);
+  assert(!main.includes('.bot-tmp'), 'nama file sementara bocor ke sshd_config');
+  // duplikat global dibuang, sisanya tepat satu baris "PasswordAuthentication yes"
+  const pwLines = main.split('\n').filter(l => /^PasswordAuthentication\b/.test(l));
+  assert.strictEqual(pwLines.length, 1, 'baris global PasswordAuthentication harus tepat satu, dapat: ' + JSON.stringify(pwLines));
+  assert.strictEqual(pwLines[0], 'PasswordAuthentication yes');
+  const rootLines = main.split('\n').filter(l => /^PermitRootLogin\b/.test(l));
+  assert.strictEqual(rootLines.length, 1, 'baris global PermitRootLogin harus tepat satu: ' + JSON.stringify(rootLines));
+  assert.strictEqual(rootLines[0], 'PermitRootLogin yes');
+  // Baris yang dikomentar tidak boleh ikut "dihidupkan" jadi duplikat
+  assert(main.includes('#PasswordAuthentication yes'), 'baris komentar harus tetap ada');
+  // Isi blok Match tidak boleh disentuh
+  const matchIdx = main.indexOf('Match User sftponly');
+  assert(matchIdx > -1, 'blok Match hilang dari config');
+  assert(main.slice(matchIdx).includes('PasswordAuthentication no'), 'isi blok Match ikut diubah (harusnya dibiarkan)');
+  // Baris lain utuh
+  assert(main.includes('Subsystem'), 'baris Subsystem hilang');
+  assert(main.includes('UsePAM yes'), 'baris UsePAM hilang');
+  // Drop-in bawaan image ikut dibetulkan + drop-in bot dibuat paling awal
+  const cloud = fs.readFileSync(path.join(fx.dropinDir, '60-cloudimg-settings.conf'), 'utf8');
+  assert(/^PasswordAuthentication yes$/m.test(cloud), 'drop-in 60-cloudimg masih "no":\n' + cloud);
+  const noRoot = fs.readFileSync(path.join(fx.dropinDir, '50-no-root.conf'), 'utf8');
+  assert(!/^PermitRootLogin no$/m.test(noRoot), 'drop-in 50-no-root masih melarang root:\n' + noRoot);
+  const botDropin = path.join(fx.dropinDir, sshdConfig.DROPIN_NAME);
+  assert(fs.existsSync(botDropin), 'drop-in bot tidak dibuat: ' + botDropin);
+  const botContent = fs.readFileSync(botDropin, 'utf8');
+  assert(botContent.includes('PasswordAuthentication yes') && botContent.includes('PermitRootLogin yes'),
+    'isi drop-in bot salah: ' + botContent);
+  assert(botDropin.includes('00-'), 'drop-in bot harus ber-awalan 00- agar menang di load order');
+  // Tidak boleh ada file sementara yang tertinggal di sekitar config
+  const leftovers = fs.readdirSync(fx.cfgDir).filter(f => f.includes('bot-tmp') || f.endsWith('.awk'));
+  assert.deepStrictEqual(leftovers, [], 'ada file sementara tertinggal: ' + JSON.stringify(leftovers));
+  // Script wajib pakai mktemp + trap, bukan nama file tetap di /tmp (symlink attack saat root)
+  const script = sshdConfig.getFixCommands(true, opts);
+  assert(script.includes('mktemp'), 'script harus membuat file sementara lewat mktemp');
+  assert(/trap .*rm -f "\$BOT_TMP"/.test(script), 'script harus membersihkan file sementara lewat trap');
+  assert(!/\/tmp\/sshd_fix_config\.awk/.test(script), 'jangan pakai nama file tetap di /tmp untuk program awk');
+  assertEffectiveYes(fx, opts, 'ubuntu');
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+ok('sshd fix: Debian tanpa Include & tanpa dir drop-in -> keyword disisipkan', () => {
+  if (!haveBin('sh')) return;
+  const { fx, opts } = assertIdempotent('debian-simple');
+  const main = fs.readFileSync(fx.main, 'utf8');
+  assert(!main.includes('#BOT#'), 'penanda internal bocor:\n' + main);
+  const pwLines = main.split('\n').filter(l => /^PasswordAuthentication\b/.test(l));
+  assert.strictEqual(pwLines.length, 1, 'harus tepat satu baris global: ' + JSON.stringify(pwLines) + '\n' + main);
+  assert.strictEqual(pwLines[0], 'PasswordAuthentication yes');
+  assert(main.includes('Port 22') && main.includes('UsePAM yes'), 'baris lain hilang:\n' + main);
+  assertEffectiveYes(fx, opts, 'debian-simple');
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+ok('sshd fix: blok Match muncul sebelum keyword global -> sisip di scope global', () => {
+  if (!haveBin('sh')) return;
+  const { fx, opts } = assertIdempotent('match-first');
+  const main = fs.readFileSync(fx.main, 'utf8');
+  assert(!main.includes('#BOT#'), 'penanda internal bocor:\n' + main);
+  const matchIdx = main.indexOf('Match User deploy');
+  assert(matchIdx > -1, 'blok Match hilang dari config:\n' + main);
+  // PasswordAuthentication belum ada di scope global -> harus disisipkan SEBELUM blok Match
+  const pwIdx = main.search(/^PasswordAuthentication yes$/m);
+  assert(pwIdx > -1, 'PasswordAuthentication yes tidak disisipkan:\n' + main);
+  assert(pwIdx < matchIdx, 'baris disisipkan setelah blok Match (jadi ikut scope Match):\n' + main);
+  // PermitRootLogin no di fixture ini ada SEBELUM Match (scope global) -> wajib jadi yes
+  assert(!/^PermitRootLogin no$/m.test(main.split('\n').slice(0, main.split('\n').findIndex(l => l.startsWith('Match'))).join('\n')),
+    'PermitRootLogin no di scope global tidak dibetulkan:\n' + main);
+  // Isi scope Match wajib dibiarkan apa adanya
+  const matchPart = main.slice(matchIdx);
+  assert(matchPart.includes('PasswordAuthentication no'), 'baris di dalam blok Match ikut diubah:\n' + main);
+  assert(matchPart.includes('ForceCommand internal-sftp'), 'isi blok Match hilang:\n' + main);
+  assertEffectiveYes(fx, opts, 'match-first');
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+ok('sshd fix: config yang sudah benar tidak diubah jadi rusak (idempotent penuh)', () => {
+  if (!haveBin('sh')) return;
+  const { fx, opts } = assertIdempotent('already-ok');
+  const main = fs.readFileSync(fx.main, 'utf8');
+  assert(!main.includes('#BOT#'), 'penanda internal bocor:\n' + main);
+  const pwLines = main.split('\n').filter(l => /^PasswordAuthentication\b/.test(l));
+  assert.strictEqual(pwLines.length, 1, 'harus tetap satu baris: ' + JSON.stringify(pwLines) + '\n' + main);
+  assertEffectiveYes(fx, opts, 'already-ok');
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+ok('sshd fix: mode non-root (sudo) tetap menghasilkan script valid & tidak menyentuh PermitRootLogin', () => {
+  if (!haveBin('sh')) return;
+  const fx = makeSshdFixture('ubuntu');
+  const opts = fixtureOpts(fx);
+  const script = sshdConfig.getFixCommands(false, opts);
+  assert(!/PermitRootLogin/.test(script.replace(/^#.*$/gm, '')), 'script non-root tidak boleh memaksa PermitRootLogin');
+  // Jalankan tanpa sudo sungguhan: di lingkungan test user bisa tulis fixture-nya sendiri,
+  // jadi ganti 'sudo -n ' jadi '' agar bisa dieksekusi.
+  const runnable = script.replace(/sudo -n /g, '');
+  const res = require('child_process').spawnSync('sh', ['-c', runnable], { encoding: 'utf8', timeout: 30000 });
+  assert.strictEqual(res.status, 0, `script non-root gagal rc=${res.status}: ${res.stderr}`);
+  const main = fs.readFileSync(fx.main, 'utf8');
+  assert(!main.includes('#BOT#'), 'penanda internal bocor:\n' + main);
+  assert(/^PasswordAuthentication yes$/m.test(main), 'PasswordAuthentication tidak dibetulkan:\n' + main);
+  // PermitRootLogin tidak boleh dipaksa yes saat bukan root
+  assert(!/^PermitRootLogin yes$/m.test(main), 'PermitRootLogin ikut diubah pada mode non-root:\n' + main);
+  const botDropin = path.join(fx.dropinDir, sshdConfig.DROPIN_NAME);
+  const botContent = fs.readFileSync(botDropin, 'utf8');
+  assert(botContent.includes('PasswordAuthentication yes'), 'drop-in bot salah (non-root): ' + botContent);
+  assert(!botContent.includes('PermitRootLogin'), 'drop-in bot non-root tidak boleh set PermitRootLogin: ' + botContent);
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+ok('sshd fix: backup & rollback memulihkan config asli', () => {
+  if (!haveBin('sh')) return;
+  const fx = makeSshdFixture('ubuntu');
+  const opts = fixtureOpts(fx);
+  const original = fs.readFileSync(fx.main, 'utf8');
+  const backupDir = path.join(fx.dir, 'backup');
+  // backup
+  for (const cmd of sshdConfig.getBackupCommands(backupDir, true, opts)) shRun(cmd);
+  assert(fs.existsSync(path.join(backupDir, 'sshd_config')), 'backup config utama tidak ada');
+  assert(fs.existsSync(path.join(backupDir, '60-cloudimg-settings.conf')), 'backup drop-in tidak ada');
+  // ubah
+  const r = runFixScript(true, opts);
+  assert.strictEqual(r.rc, 0, r.stderr);
+  assert(fs.readFileSync(fx.main, 'utf8') !== original, 'fix tidak mengubah apa pun');
+  // rollback
+  shRun(sshdConfig.getRollbackCommands(backupDir, true, opts));
+  assert.strictEqual(fs.readFileSync(fx.main, 'utf8'), original, 'rollback tidak memulihkan config utama');
+  const restoredDropin = fs.readFileSync(path.join(fx.dropinDir, '60-cloudimg-settings.conf'), 'utf8');
+  assert(restoredDropin.includes('PasswordAuthentication no'), 'rollback tidak memulihkan drop-in');
+  assert(!fs.existsSync(path.join(fx.dropinDir, sshdConfig.DROPIN_NAME)), 'drop-in bot harus dibuang saat rollback');
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+ok('sshd fix: keyword tidak valid ditolak (anti injeksi ke sshd_config)', () => {
+  if (!haveBin('sh')) return;
+  const fx = makeSshdFixture('ubuntu');
+  const opts = fixtureOpts(fx);
+  const before = fs.readFileSync(fx.main, 'utf8');
+  // siapkan program awk seperti script asli, lalu panggil ensure_global dengan keyword jahat
+  const script = sshdConfig.getFixCommands(true, opts);
+  const head = script.slice(0, script.indexOf('# 1) Drop-in milik bot'));
+  const probe = head + '\nensure_global ' + fx.main + ' "PasswordAuthentication; rm -rf /tmp/x" yes; echo "rc=$?"\n';
+  const res = require('child_process').spawnSync('sh', ['-c', probe], { encoding: 'utf8', timeout: 30000 });
+  assert(/rc=2/.test(res.stdout), 'keyword tidak valid harus ditolak (rc=2), dapat: ' + res.stdout + res.stderr);
+  assert.strictEqual(fs.readFileSync(fx.main, 'utf8'), before, 'config berubah walau keyword ditolak');
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+ok('sshd fix: awk error -> ensure_global gagal terang-terangan (bukan diam-diam "sukses")', () => {
+  if (!haveBin('sh')) return;
+  const fx = makeSshdFixture('ubuntu');
+  const opts = fixtureOpts(fx);
+  const before = fs.readFileSync(fx.main, 'utf8');
+  const script = sshdConfig.getFixCommands(true, opts);
+  const head = script.slice(0, script.indexOf('# 1) Drop-in milik bot'));
+  // Rusak program awk: pastikan kegagalan terdeteksi, bukan dianggap "sudah ada".
+  // (Dulu exit code 2 dari mawk bentrok dengan penanda "sudah ada", jadi error
+  //  fatal awk bisa terbaca sebagai sukses.)
+  const probe = head + '\nAWK_HAS_PROG=\'BEGIN { syntax error ((("\'\n'
+    + `ensure_global ${fx.main} PasswordAuthentication yes; echo "rc=$?"\n`;
+  const res = require('child_process').spawnSync('sh', ['-c', probe], { encoding: 'utf8', timeout: 30000 });
+  assert(/rc=1/.test(res.stdout), 'harus gagal rc=1 saat awk error, dapat: ' + res.stdout + res.stderr);
+  assert.strictEqual(fs.readFileSync(fx.main, 'utf8'), before, 'config berubah walau awk error');
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+ok('sshd fix: file config tidak boleh dikosongkan saat awk gagal di tengah jalan', () => {
+  if (!haveBin('sh')) return;
+  const fx = makeSshdFixture('ubuntu');
+  const opts = fixtureOpts(fx);
+  const before = fs.readFileSync(fx.main, 'utf8');
+  const script = sshdConfig.getFixCommands(true, opts);
+  const head = script.slice(0, script.indexOf('# 1) Drop-in milik bot'));
+  // Program fix rusak (hasil kosong) -> guard `[ ! -s "$BOT_TMP" ]` harus menolak menulis
+  const probe = head + '\nAWK_FIX_PROG=\'BEGIN { exit 0 }\'\nAWK_HAS_PROG=\'BEGIN { exit 3 }\'\n'
+    + `ensure_global ${fx.main} PasswordAuthentication yes; echo "rc=$?"\n`;
+  const res = require('child_process').spawnSync('sh', ['-c', probe], { encoding: 'utf8', timeout: 30000 });
+  assert(/rc=1/.test(res.stdout), 'harus gagal rc=1 saat hasil awk kosong: ' + res.stdout + res.stderr);
+  assert.strictEqual(fs.readFileSync(fx.main, 'utf8'), before, 'sshd_config ikut kosong/rusak');
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+// === Regresi: setupFlow end-to-end dengan sesi SSH palsu ===
+// Perintah SSH yang "berbahaya"/tidak tersedia di sandbox (restart layanan,
+// chpasswd) dijawab sendiri; sisanya (script fix sshd, backup) benar-benar
+// dijalankan lewat `sh` terhadap fixture, jadi bug script ikut ketahuan.
+
+function makeFakeSshSession(overrides = {}) {
+  const log = [];
+  const sess = {
+    username: 'root',
+    log,
+    closed: false,
+    async exec(cmd) {
+      log.push(cmd);
+      const answer = (code, stdout = '', stderr = '') => ({ code, stdout, stderr });
+      if (cmd.includes('/etc/os-release')) {
+        return answer(0, overrides.osRelease !== undefined ? overrides.osRelease
+          : 'PRETTY_NAME="Ubuntu 24.04.1 LTS"\nNAME="Ubuntu"\nID=ubuntu\nVERSION_ID="24.04"\n');
+      }
+      if (/^\s*(sudo -n\s+)?sshd\s/.test(cmd)) {
+        if (overrides.sshd) return overrides.sshd(cmd);
+        if (!SSHD_AVAILABLE) {
+          return cmd.includes('-T') ? answer(0, 'passwordauthentication yes\npermitrootlogin yes\n') : answer(0, '');
+        }
+        const full = cmd.replace(/(^|\s)sshd(\s)/, `$1${SSHD_BIN}$2`);
+        const r = require('child_process').spawnSync('sh', ['-c', full], { encoding: 'utf8', timeout: 20000 });
+        return answer(r.status, r.stdout || '', r.stderr || '');
+      }
+      if (cmd.includes('systemctl restart') || cmd.includes('service ssh')) {
+        return overrides.restart ? overrides.restart(cmd) : answer(0, 'restarted ssh via systemctl\n');
+      }
+      if (cmd.includes('chpasswd')) {
+        return overrides.chpasswd ? overrides.chpasswd(cmd) : answer(0, '');
+      }
+      if (cmd.trim() === 'whoami') return answer(0, overrides.whoami || 'root\n');
+      const r = require('child_process').spawnSync('sh', ['-c', cmd], { encoding: 'utf8', timeout: 30000 });
+      return answer(r.status, r.stdout || '', r.stderr || '');
+    },
+    close() { this.closed = true; }
+  };
+  return sess;
+}
+
+function makeProgress() {
+  const LiveProgress = require('../lib/progress');
+  const sent = [];
+  const prog = new LiveProgress({ telegram: { async editMessageText(a, b, c, text) { sent.push(text); } } }, 1, 2, 'T', 900);
+  prog.sent = sent;
+  return prog;
+}
+
+okAsync('setupFlow: 9 langkah sukses end-to-end (regresi error "key is not defined")', async () => {
+  const { setupVpsFlow, SETUP_STEPS } = require('../lib/setupFlow');
+  const fx = makeSshdFixture('ubuntu');
+  const opts = fixtureOpts(fx);
+  const prog = makeProgress();
+  const ssh = makeFakeSshSession();
+  const res = await setupVpsFlow({
+    sshSession: ssh, targetUsername: 'root', password: 'Abc1234567',
+    isRootUser: true, progress: prog, sshdOpts: opts
+  });
+  // Inilah asersi utamanya: dengan bug lama, getFixCommands melempar
+  // ReferenceError di dalam try -> success:false dengan error "key is not defined"
+  assert.strictEqual(res.success, true, 'setup harus sukses, tapi gagal: ' + res.error);
+  assert(!/is not defined/.test(res.error || ''), 'masih ada ReferenceError: ' + res.error);
+  assert.strictEqual(prog.steps.length, SETUP_STEPS.length, 'jumlah langkah harus 9');
+  const bad = prog.steps.filter(s => s.status !== 'done');
+  assert.deepStrictEqual(bad, [], 'semua langkah harus done: ' + JSON.stringify(prog.steps));
+  assert.strictEqual(res.os.id, 'ubuntu');
+  assert.strictEqual(res.os.versionId, '24.04');
+  // Efek nyata ke config fixture
+  const main = fs.readFileSync(fx.main, 'utf8');
+  assert(/^PasswordAuthentication yes$/m.test(main), 'config tidak berubah:\n' + main);
+  // Password dikirim base64, tidak pernah plaintext di command line
+  const chp = ssh.log.find(c => c.includes('chpasswd'));
+  assert(chp, 'chpasswd tidak pernah dipanggil');
+  assert(!chp.includes('Abc1234567'), 'password bocor plaintext ke perintah: ' + chp);
+  assert(chp.includes(Buffer.from('root:Abc1234567').toString('base64')), 'harus lewat base64: ' + chp);
+  // Backup dibuat sebelum config disentuh
+  assert(ssh.log.some(c => c.includes('mkdir -p /tmp/sshd_backup_')), 'tidak ada langkah backup');
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+okAsync('setupFlow: stepOffset menjaga checklist induk (Buat VPS / Reinstall Resmi)', async () => {
+  const { setupVpsFlow, SETUP_STEPS } = require('../lib/setupFlow');
+  const fx = makeSshdFixture('ubuntu');
+  const opts = fixtureOpts(fx);
+  const prog = makeProgress();
+  // Checklist induk persis seperti alur "Buat VPS" di index.js
+  ['Buat server di UpCloud', 'Tunggu state started', 'Tunggu port 22',
+   'Setup password (jika mode password)', 'Tes login password', 'Hapus key bot'].forEach(s => prog.addStep(s));
+  prog.setDone(0, 'UUID 001799d1');
+  prog.setDone(1, 'started');
+  prog.setDone(2, '22 terbuka');
+  prog.setRunning(3, 'setup password');
+  const off = prog.insertStepsAt(4, SETUP_STEPS);
+  assert.strictEqual(off, 4, 'offset harus 4');
+  assert.strictEqual(prog.steps.length, 15, 'total langkah harus 6 + 9');
+
+  const res = await setupVpsFlow({
+    sshSession: makeFakeSshSession(), targetUsername: 'root', password: 'Abc1234567',
+    isRootUser: true, progress: prog, stepOffset: off, sshdOpts: opts
+  });
+  assert.strictEqual(res.success, true, 'setup harus sukses: ' + res.error);
+  // Langkah induk TIDAK boleh tertimpa oleh sub-langkah setup (bug lama)
+  assert.strictEqual(prog.steps[0].name, 'Buat server di UpCloud');
+  assert.strictEqual(prog.steps[0].detail, 'UUID 001799d1', 'detail langkah 0 tertimpa');
+  assert.strictEqual(prog.steps[0].status, 'done');
+  assert.strictEqual(prog.steps[1].detail, 'started', 'detail langkah 1 tertimpa');
+  assert.strictEqual(prog.steps[2].detail, '22 terbuka', 'detail langkah 2 tertimpa');
+  assert.strictEqual(prog.steps[3].status, 'running', 'langkah induk "Setup password" ikut diubah');
+  // 9 sub-langkah setup semuanya done
+  for (let i = off; i < off + SETUP_STEPS.length; i++) {
+    assert.strictEqual(prog.steps[i].status, 'done', `sub-langkah ${i} belum done: ` + JSON.stringify(prog.steps[i]));
+  }
+  // Langkah setelah sub-langkah tetap di tempatnya, siap dipakai index.js
+  assert.strictEqual(prog.steps[13].name, 'Tes login password');
+  assert.strictEqual(prog.steps[13].status, 'pending');
+  assert.strictEqual(prog.steps[14].name, 'Hapus key bot');
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+okAsync('setupFlow: OS non-Ubuntu/Debian ditolak sebelum config disentuh', async () => {
+  const { setupVpsFlow } = require('../lib/setupFlow');
+  const fx = makeSshdFixture('ubuntu');
+  const opts = fixtureOpts(fx);
+  const before = fs.readFileSync(fx.main, 'utf8');
+  const prog = makeProgress();
+  const ssh = makeFakeSshSession({ osRelease: 'NAME="Alpine Linux"\nID=alpine\nVERSION_ID="3.19"\n' });
+  const res = await setupVpsFlow({
+    sshSession: ssh, targetUsername: 'root', password: 'Abc1234567',
+    isRootUser: true, progress: prog, sshdOpts: opts
+  });
+  assert.strictEqual(res.success, false, 'harus gagal untuk Alpine');
+  assert(/alpine/i.test(res.error), 'pesan error harus menyebut OS-nya: ' + res.error);
+  assert.strictEqual(fs.readFileSync(fx.main, 'utf8'), before, 'config terlanjur diubah walau OS ditolak');
+  assert.strictEqual(prog.steps[1].status, 'fail', 'langkah Deteksi OS harus ditandai gagal');
+  assert(!ssh.log.some(c => c.includes('chpasswd')), 'tidak boleh sampai set password');
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+okAsync('setupFlow: sshd -t gagal -> rollback config & lapor gagal', async () => {
+  const { setupVpsFlow } = require('../lib/setupFlow');
+  const fx = makeSshdFixture('ubuntu');
+  const opts = fixtureOpts(fx);
+  const original = fs.readFileSync(fx.main, 'utf8');
+  const prog = makeProgress();
+  // backup tetap jalan nyata supaya rollback punya bahan
+  const ssh = makeFakeSshSession({
+    sshd: (cmd) => cmd.includes('-t') ? { code: 255, stdout: '', stderr: 'Bad configuration option: bogus\n' }
+      : { code: 0, stdout: 'passwordauthentication yes\npermitrootlogin yes\n', stderr: '' }
+  });
+  const res = await setupVpsFlow({
+    sshSession: ssh, targetUsername: 'root', password: 'Abc1234567',
+    isRootUser: true, progress: prog, sshdOpts: opts
+  });
+  assert.strictEqual(res.success, false, 'harus gagal saat sshd -t gagal');
+  assert(/sshd -t/.test(res.error), 'pesan error harus menyebut sshd -t: ' + res.error);
+  assert(/Bad configuration option/.test(res.error), 'stderr sshd harus ikut dilaporkan: ' + res.error);
+  assert.strictEqual(res.rollbackStatus, 'berhasil dipulihkan');
+  assert.strictEqual(fs.readFileSync(fx.main, 'utf8'), original, 'rollback tidak memulihkan config');
+  assert(!fs.existsSync(path.join(fx.dropinDir, sshdConfig.DROPIN_NAME)), 'drop-in bot harus dibuang saat rollback');
+  assert(!ssh.log.some(c => c.includes('chpasswd')), 'tidak boleh set password setelah rollback');
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+okAsync('setupFlow: hasil sshd -T masih "no" -> rollback & lapor gagal', async () => {
+  const { setupVpsFlow } = require('../lib/setupFlow');
+  const fx = makeSshdFixture('ubuntu');
+  const opts = fixtureOpts(fx);
+  const original = fs.readFileSync(fx.main, 'utf8');
+  const prog = makeProgress();
+  const ssh = makeFakeSshSession({
+    sshd: (cmd) => cmd.includes('-T') ? { code: 0, stdout: 'passwordauthentication no\n', stderr: '' }
+      : { code: 0, stdout: '', stderr: '' }
+  });
+  const res = await setupVpsFlow({
+    sshSession: ssh, targetUsername: 'root', password: 'Abc1234567',
+    isRootUser: true, progress: prog, sshdOpts: opts
+  });
+  assert.strictEqual(res.success, false);
+  assert(/PasswordAuthentication no/.test(res.error), 'error harus jelas: ' + res.error);
+  assert.strictEqual(fs.readFileSync(fx.main, 'utf8'), original, 'rollback tidak memulihkan config');
+  fs.rmSync(fx.dir, { recursive: true, force: true });
+});
+
+ok('progress: insertStepsAt menyisip di posisi benar, clamp index, dan return offset', () => {
+  const LiveProgress = require('../lib/progress');
+  const prog = new LiveProgress({ telegram: { async editMessageText() {} } }, 1, 2, 'T', 900);
+  prog.addStep('a'); prog.addStep('b'); prog.addStep('c');
+  assert.strictEqual(prog.addStep('d'), 3, 'addStep harus mengembalikan indexnya');
+  assert.strictEqual(prog.insertStepsAt(2, ['x', 'y']), 2);
+  assert.deepStrictEqual(prog.steps.map(s => s.name), ['a', 'b', 'x', 'y', 'c', 'd']);
+  assert.strictEqual(prog.steps[2].status, 'pending');
+  // clamp: index melebihi panjang -> append di akhir; index negatif -> awal
+  assert.strictEqual(prog.insertStepsAt(99, ['z']), 6);
+  assert.strictEqual(prog.steps[prog.steps.length - 1].name, 'z');
+  assert.strictEqual(prog.insertStepsAt(-5, ['first']), 0);
+  assert.strictEqual(prog.steps[0].name, 'first');
+  prog.stop();
+});
+
+ok('progress: failRunning menandai langkah yang benar walau index bergeser', () => {
+  const LiveProgress = require('../lib/progress');
+  const prog = new LiveProgress({ telegram: { async editMessageText() {} } }, 1, 2, 'T', 900);
+  ['a', 'b', 'c'].forEach(s => prog.addStep(s));
+  prog.setDone(0, 'ok');
+  prog.setDone(1, 'ok');
+  prog.setRunning(2, 'jalan');
+  // Sisipkan sub-langkah SEBELUM langkah yang sedang jalan: index-nya bergeser 2 -> 4
+  prog.insertStepsAt(1, ['x', 'y']);
+  assert.deepStrictEqual(prog.steps.map(s => s.name), ['a', 'x', 'y', 'b', 'c']);
+  assert.strictEqual(prog.steps.findIndex(s => s.status === 'running'), 4, 'precondition: running harus bergeser ke index 4');
+  // setFail(2) yang di-hardcode akan menandai 'y' (langkah salah); failRunning tidak
+  assert.strictEqual(prog.failRunning('error di tengah jalan'), 4);
+  assert.strictEqual(prog.steps[4].name, 'c');
+  assert.strictEqual(prog.steps[4].status, 'fail');
+  assert.strictEqual(prog.steps[4].detail, 'error di tengah jalan');
+  assert.strictEqual(prog.steps[2].status, 'pending', 'langkah lain tidak boleh ikut ditandai gagal');
+  assert.strictEqual(prog.steps[0].status, 'done');
+
+  // Fallback: tidak ada yang running -> pakai pending pertama
+  const p2 = new LiveProgress({ telegram: { async editMessageText() {} } }, 1, 2, 'T', 900);
+  p2.addStep('a'); p2.addStep('b');
+  p2.setDone(0);
+  assert.strictEqual(p2.failRunning('x'), 1);
+  // Fallback terakhir: semua sudah done -> langkah terakhir
+  const p3 = new LiveProgress({ telegram: { async editMessageText() {} } }, 1, 2, 'T', 900);
+  p3.addStep('a'); p3.setDone(0);
+  assert.strictEqual(p3.failRunning('x'), 0);
+  // Tanpa langkah sama sekali -> -1, tidak melempar
+  const p4 = new LiveProgress({ telegram: { async editMessageText() {} } }, 1, 2, 'T', 900);
+  assert.strictEqual(p4.failRunning('x'), -1);
+  p4.stop(); p3.stop(); p2.stop(); prog.stop();
+});
+
 // === Mock UpCloud API (HTTP lokal) ===
 async function testMockUpCloud() {
   const server = http.createServer((req, res) => {
@@ -752,11 +1415,14 @@ async function testMockUpCloud() {
   server.close();
 }
 
-testMockUpCloud().then(() => {
-  console.log(`\n=== HASIL TEST: ${passed} lulus, ${failed} gagal ===`);
-  if (failed > 0) process.exit(1);
-  else console.log('Semua tes dasar lulus. Catatan: tes integrasi penuh dengan VPS sungguhan belum dilakukan (sesuai risiko di README).');
-}).catch(e => {
-  console.error('Error mock test:', e);
-  process.exit(1);
-});
+Promise.all(pendingAsync)
+  .then(() => testMockUpCloud())
+  .then(() => Promise.all(pendingAsync))
+  .then(() => {
+    console.log(`\n=== HASIL TEST: ${passed} lulus, ${failed} gagal ===`);
+    if (failed > 0) process.exit(1);
+    else console.log('Semua tes dasar lulus. Catatan: tes integrasi penuh dengan VPS sungguhan belum dilakukan (sesuai risiko di README).');
+  }).catch(e => {
+    console.error('Error saat menjalankan test:', e);
+    process.exit(1);
+  });
