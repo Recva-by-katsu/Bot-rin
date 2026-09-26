@@ -344,6 +344,52 @@ ok('upcloud: translateError ramah', () => {
   assert(client.translateError(err429).includes('Terlalu banyak'));
 });
 
+ok('upcloud: translateError tidak menyalahkan koneksi UpCloud untuk bug kode lokal', () => {
+  const client = new UpCloudClient('dummy');
+  // Inilah bentuk error yang dilaporkan user: ReferenceError dari kode bot sendiri.
+  // Dulu dilabeli "Gagal terhubung ke UpCloud" sehingga menyesatkan.
+  const refErr = new ReferenceError('key is not defined');
+  const txt = client.translateError(refErr);
+  assert(!/Gagal terhubung ke UpCloud/.test(txt), 'bug lokal tidak boleh dibilang gagal koneksi: ' + txt);
+  assert(/bukan dari API UpCloud/.test(txt), 'harus jelas ini error sisi bot: ' + txt);
+  assert(txt.includes('key is not defined'), 'pesan asli harus tetap terlihat: ' + txt);
+
+  // Error SSH / setup di VPS juga bukan urusan koneksi UpCloud
+  const sshErr = new Error('Setup password gagal: sshd -t gagal');
+  assert(!/Gagal terhubung ke UpCloud/.test(client.translateError(sshErr)));
+
+  // Kegagalan jaringan sungguhan TETAP dibilang gagal terhubung
+  const timeout = new Error('Timeout koneksi ke UpCloud');
+  timeout.status = 0; timeout.code = 'TIMEOUT';
+  assert(/Gagal terhubung ke UpCloud/.test(client.translateError(timeout)), 'timeout harus tetap dianggap gagal koneksi');
+  assert(UpCloudClient.isNetworkError(timeout));
+
+  const dns = new TypeError('fetch failed');
+  dns.cause = Object.assign(new Error('getaddrinfo ENOTFOUND api.upcloud.com'), { code: 'ENOTFOUND' });
+  assert(UpCloudClient.isNetworkError(dns), 'fetch failed + ENOTFOUND harus terdeteksi');
+  assert(/Gagal terhubung ke UpCloud/.test(client.translateError(dns)));
+
+  const refused = new Error('connect ECONNREFUSED');
+  refused.cause = Object.assign(new Error('x'), { code: 'ECONNREFUSED' });
+  assert(UpCloudClient.isNetworkError(refused));
+
+  // Bukan jaringan: ReferenceError / error biasa
+  assert(!UpCloudClient.isNetworkError(refErr), 'ReferenceError bukan error jaringan');
+  assert(!UpCloudClient.isNetworkError(sshErr), 'error setup SSH bukan error jaringan');
+  assert(!UpCloudClient.isNetworkError(null), 'null tidak boleh melempar');
+
+  // Secret tetap diredaksi di dalam pesan
+  const leaky = new Error('gagal pakai token ucat_ABCDEF1234567890 di host');
+  const leakyTxt = client.translateError(leaky);
+  assert(!leakyTxt.includes('ucat_ABCDEF1234567890'), 'token bocor ke pesan user: ' + leakyTxt);
+  assert(leakyTxt.includes('***'), 'token harus diganti ***');
+
+  // Error API ber-status tetap pakai pemetaan lama
+  const e500 = new Error('Internal'); e500.status = 500;
+  assert(/Server UpCloud error/.test(client.translateError(e500)));
+  assert(/error tidak dikenal/.test(client.translateError(null)));
+});
+
 // === Test Cek API expiring ≤7 hari ===
 ok('cek API: peringatan kedaluwarsa ≤7 hari', () => {
   const now = Date.now();

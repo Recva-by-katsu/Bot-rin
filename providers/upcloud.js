@@ -2,7 +2,7 @@
  * providers/upcloud.js - Klien API UpCloud
  * Base https://api.upcloud.com, auth Bearer <token>
  */
-const { shellEscape } = require('../lib/validators');
+const { shellEscape, redactSecrets } = require('../lib/validators');
 
 const BASE = 'https://api.upcloud.com';
 
@@ -104,17 +104,57 @@ class UpCloudClient {
     return json.billing?.currency || json.billing_summary?.currency || json.currency || '';
   }
 
-  translateError(err) {
-    if (!err.status) return `⚠️ Gagal terhubung ke UpCloud: ${err.message}. Coba lagi nanti.`;
-    if (err.status === 401) return `❌ Token salah / dicabut / kedaluwarsa (401). Buat token baru di panel UpCloud.`;
-    if (err.status === 403) {
-      return `⚠️ Ditolak (403): izin kurang atau token dibatasi IP. Cek Allowed IP ranges token di panel UpCloud dan pastikan IP server bot diizinkan.`;
+  /**
+   * Apakah error ini benar-benar kegagalan jaringan saat menghubungi API
+   * UpCloud (bukan error API ber-status HTTP, dan bukan bug kode bot).
+   *
+   * fetch di Node melempar `TypeError: fetch failed` dengan penyebab aslinya di
+   * `err.cause` (mis. getaddrinfo ENOTFOUND). Timeout dari AbortController
+   * sudah dinormalkan `_request` jadi status 0 + code TIMEOUT.
+   */
+  static isNetworkError(err) {
+    if (!err) return false;
+    if (err.status === 0) return true;
+    if (err.code === 'TIMEOUT') return true;
+    if (err.name === 'AbortError') return true;
+    const cause = err.cause || err;
+    const code = cause && cause.code;
+    if (typeof code === 'string') {
+      const netCodes = /^(ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ECONNABORTED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENETDOWN|EPIPE|ESOCKETTIMEDOUT|UND_ERR_|CERT_|ERR_TLS|DEPTH_ZERO_SELF_SIGNED|UNABLE_TO_VERIFY_LEAF|SELF_SIGNED_CERT)/;
+      if (netCodes.test(code)) return true;
     }
-    if (err.status === 404) return `❌ Tidak ditemukan (404): ${err.message}`;
-    if (err.status === 409) return `⚠️ Konflik (409): ${err.message}. Mungkin VPS masih dalam proses.`;
-    if (err.status === 429) return `⚠️ Terlalu banyak request (429). Coba lagi sebentar.`;
-    if (err.status >= 500) return `⚠️ Server UpCloud error (${err.status}). Coba lagi nanti.`;
-    return `⚠️ Error UpCloud (${err.status}): ${err.message}`;
+    if (err.name === 'TypeError' && /fetch failed/i.test(err.message || '')) return true;
+    return false;
+  }
+
+  /**
+   * Terjemahkan error jadi pesan Bahasa Indonesia yang ramah pemula.
+   *
+   * PENTING: hanya kegagalan jaringan/API UpCloud yang boleh dibilang "Gagal
+   * terhubung ke UpCloud". Dulu SEMUA error tanpa `status` dilabeli begitu,
+   * sehingga bug kode lokal (`ReferenceError: key is not defined`) dan
+   * kegagalan SSH/setup di VPS terbaca sebagai masalah koneksi/token UpCloud
+   * dan jadi susah dilacak. Sekarang error non-UpCloud disebut apa adanya.
+   */
+  translateError(err) {
+    if (!err) return '⚠️ Terjadi error tidak dikenal.';
+    const msg = redactSecrets(err.message || String(err));
+    if (err.status) {
+      if (err.status === 401) return `❌ Token salah / dicabut / kedaluwarsa (401). Buat token baru di panel UpCloud.`;
+      if (err.status === 403) {
+        return `⚠️ Ditolak (403): izin kurang atau token dibatasi IP. Cek Allowed IP ranges token di panel UpCloud dan pastikan IP server bot diizinkan.`;
+      }
+      if (err.status === 404) return `❌ Tidak ditemukan (404): ${msg}`;
+      if (err.status === 409) return `⚠️ Konflik (409): ${msg}. Mungkin VPS masih dalam proses.`;
+      if (err.status === 429) return `⚠️ Terlalu banyak request (429). Coba lagi sebentar.`;
+      if (err.status >= 500) return `⚠️ Server UpCloud error (${err.status}). Coba lagi nanti.`;
+      return `⚠️ Error UpCloud (${err.status}): ${msg}`;
+    }
+    if (UpCloudClient.isNetworkError(err)) {
+      return `⚠️ Gagal terhubung ke UpCloud: ${msg}. Coba lagi nanti.`;
+    }
+    // Bukan dari API UpCloud: jangan menyalahkan koneksi/token.
+    return `⚠️ Error di sisi bot (bukan dari API UpCloud): ${msg}`;
   }
 
   // Account
